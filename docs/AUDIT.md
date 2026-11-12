@@ -1,0 +1,126 @@
+# AUDIT — SKSE-Bridge (Step 1, read-only)
+
+Date: 2026-11-12. Nothing outside `docs/` was modified. No code was compiled or run.
+Tags: **[V]** Verified (file:line or git object), **[A]** Assumption, **[U]** Unknown.
+`CL/` = `lib/commonlibsse-ng/`. `NEW` = commit `9955ae3` found in the local submodule pack (see e).
+
+## 0. Blockers and findings that change the plan
+
+1. **Legacy DLL path not supplied** (`<PATH TO LEGACY DLL>` is still a placeholder). Section g is not done. The DLL must sit in a folder I'm granted read access to.
+2. **1.7.99 Address Library is file format 5, not 2.** [V] `NEW:src/REL/IDDB.cpp:193-213` accepts formats 1, 2, 5; commit `7b47c5a` (2026-08-21) is titled "support AE 1.7.99 address library format 5". Format 5 is a dense `u32` offset array, not the packed v2 stream. Whether the file you installed is format 5: [U] until I can read its first 4 bytes.
+3. **Consequence: the Step 3 design as written cannot work alone.** In the pinned CommonLib the legacy code reads the file header *before* it tries the shared mapping: [V] `CL/src/REL/ID.cpp:99-101` (open + `header.read`) precede `:109` (`_mmap.open`). On a format mismatch `header_t::read` calls `report_and_fail` [V] `CL/include/REL/ID.h:260-267`; on a missing file the stream ctor does too [V] `ID.h:222-224`. Supplying a private mapping never gets a chance. See 3.1 for the alternative.
+4. **`report_and_fail` is not an SEH exception.** [A] It shows a message box and terminates (implementation not read line by line). The Stage 1 SEH wrapper will not turn these into a logged failure. Expect Stage 1 on a real 1.7.99 to end in a fatal dialog from the legacy plugin, which is itself a useful negative control.
+5. **I cannot compile here.** This session's shell on your PC is a Linux VM with no xmake/MSVC [V] (`which xmake cl clang-cl cmake` → nothing). "Builds clean" at Checkpoint 2 must be a build you run; I can only write code and reason about it.
+6. **The project is not an empty example.** It is the PrismaUI example plugin (a–d). Converting it means deleting that code; confirm.
+
+## a. Build system, toolchain, dependencies
+
+- xmake ≥ 3.0.1, C++23, MSVC + ninja. [V] `xmake.lua:1,8,11`. No CMake/vcpkg at project level.
+- `set_license('GPL-3.0')` is already declared for this project. [V] `xmake.lua:6`. Template leftover or intent: [U], your call (see f).
+- CommonLib is included from source: `includes('lib/commonlibsse-ng')`, `add_deps('commonlibsse-ng')`. [V] `xmake.lua:2,38`. Static lib. [V] `CL/xmake.lua:93`.
+- **CommonLib is vendored as plain files, not a submodule gitlink.** 2,878 tracked files under `CL/`. [V] `git ls-files`. `.gitmodules` still names `alandtse/CommonLibVR`, branch `ng`. [V] `.gitmodules:1-4`. `CL/.git` points at `.git/modules/lib/commonlibsse-ng`, which holds only `objects/` (no HEAD/refs), so git cannot report a revision directly. [V]
+- **Revision, recovered by tree hash:** vendored `include/` tree `a9e5fa79` and `src/` tree `1dba5330` both equal those of commit **`539d4ce50969e8d23f4d507a7bc3dd955a4de93f`** (2025-04-11, "fix: fix ae ID (#80)"). [V] Files outside `include/` and `src/` were not compared.
+- CommonLib license at that revision: MIT, © 2018 Ryan-rsm-McKenzie. [V] `CL/LICENSE:1-3`, `CL/vcpkg.json:8` (version-semver 3.7.0). No COPYING/EXCEPTIONS file there. [V]
+- Other in-tree code:
+  - `ClibUtil` @ `5f845f3` (powerof3), MIT [V] `ClibUtil/LICENSE`. Gitlink exists but has no `.gitmodules` entry (`git submodule status` fails). [V] Unused by `src/`. [V]
+  - `xbyak` @ `df11286` (herumi), BSD-style [V] `xbyak/COPYRIGHT`. Working tree shows local modifications. [V] Unused by `src/`. [V]
+  - `CL/extern/openvr`, © Valve, BSD-style [V] `LICENSE:1`. Headers used only when `skyrim_vr` is on. [V] `CL/xmake.lua:101-104`.
+  - Include dir `$(projectdir)/simpleini` does not exist. [V] `xmake.lua:65`.
+- xmake packages (lock file): spdlog v1.15.2, directxmath 2024.02, directxtk 24.2.0, rapidcsv v8.85. [V] `xmake-requires.lock`. Their licenses were not read. [U]
+- Single commit `8ac018d` ("Initial commit from CommonLibSSE-NG template", today). [V]
+
+## b. Runtime flags and compile definitions
+
+- Project options `skyrim_se/ae/vr` all default false. [V] `xmake.lua:15-31`. With none set the target defines **both** `ENABLE_SKYRIM_SE` and `ENABLE_SKYRIM_AE`. [V] `xmake.lua:76-78`.
+- CommonLib's own options of the same names default **true** and are exported public, adding `ENABLE_SKYRIM_SE=1`, `_AE=1`, `_VR=1`. [V] `CL/xmake.lua:36-52,123`. Which set wins when both files declare the same option name: [U] (needs `xmake f -v`). Likely result is an SE+AE+VR multi-runtime build. [A]
+- In a multi-runtime build `GetRuntime()` is a runtime value. [V] `CL/include/REL/Module.h:225-233`.
+- The `runtime = ...` value passed to the plugin rule is never read by the rule. [V] `xmake.lua:53` vs `CL/xmake-rules.lua:81-115`.
+- No `SKYRIM_SUPPORT_AE` anywhere in the project files. [V]
+
+## c. Plugin declaration and entry points
+
+- Generated by the `commonlibsse-ng.plugin` rule: `SKSEPluginInfo(.Version, .Name, .Author, .SupportEmail, .StructCompatibility, .RuntimeCompatibility)`. [V] `CL/xmake-rules.lua:1-11`.
+- Values: name `SKSE-Bridge`, author `Aboda7m`, description `RTL-SUPPORT-NG` (leftover), version 1.0.0. [V] `xmake.lua:5,50-52`. No `options` table, so `StructCompatibility::Independent` + `VersionIndependence::AddressLibrary`. [V] `xmake-rules.lua:84-96`.
+- The macro exports `SKSEPlugin_Version` (a `PluginDeclaration`) and `SKSEPlugin_Query`. [V] `CL/include/SKSE/Interfaces.h:697-708`. Flag bits: AddressLibraryPostAE `1<<0`, Signatures `1<<1`, StructsPost629 `1<<2`, Ex_NoStructUse `1<<0`; `compatibleVersions[16]`; size 0x350. [V] `Interfaces.h:370-377,423,436-445`.
+- `Plugin::NAME` in source is `PrismaUI-Example-Plugin`, which disagrees with the declaration. [V] `src/plugin.h:8`.
+- `SKSEPlugin_Load` (`src/main.cpp:54-73`) [V]: `REL::Module::reset()`; queries messaging; logs; `SKSE::Init`; `AllocTrampoline(1<<10)`; registers an `"SKSE"` listener.
+- What the SKSE loader for 1.7.99 requires of these fields: [U]. No SKSE source is in the tree; loader not inspected.
+
+## d. What the project does today
+
+- On `kDataLoaded`: requests the PrismaUI API from `PrismaUI.dll`, creates a view, registers a JS listener, registers an F3 key sink. [V] `src/main.cpp:9-50`, `src/PrismaUI_API.h:69-79`, `src/keyhandler/*`.
+- Direct `REL::ID` / `RELOCATION_ID` uses in `src/`: none. [V] `pch.h:29` defines an unused `RELOCATION_OFFSET` macro. Indirect ID use via CommonLib (`BSInputDeviceManager::GetSingleton`, `AddEventSink`, trampoline) exists. [V] `keyhandler.cpp:11-13`.
+- None of this is host functionality.
+
+## e. 1.7.99 support in CommonLib
+
+- Pinned `539d4ce`: no. Latest known runtime is `RUNTIME_SSE_1_6_1170`. [V] `CL/include/SKSE/Version.h:34-38`.
+- Runtime classification there: minor 4 → VR, 6 → AE, anything else → SE. So a 1.7.x exe is classed **SE**. [V] `CL/include/REL/Module.h:339-348`. Re-verifies your earlier note.
+- ID file selection there: AE → `versionlib-<a-b-c-d>.bin` format 2; SE → `version-<...>.bin` format 1. [V] `CL/include/REL/ID.h:317-323`; dash separator `REL/Version.h:99`.
+- Shared mapping `CommonLibSSEOffsets-v2-<ver>`, `{u64 id,u64 offset}`, size `address_count*16`, opened READ|WRITE, created if absent. [V] `CL/src/REL/ID.cpp:20-23,50-61,106-113`.
+- Non-VR lookup is `lower_bound` with **no exact-match check**: a missing ID silently returns the next higher ID's offset. [V] `ID.h:184-190`. Matters for any private table.
+- Win32 calls go through `__declspec(dllimport)` stubs, i.e. the plugin's own import table. [V] `CL/include/REX/W32/BASE.h:7-8`; `GetFileVersionInfoSizeW/GetFileVersionInfoW` at `CL/src/REL/Version.cpp:10-15`; `GetEnvironmentVariableW("SKSE_RUNTIME")` at `Module.h:279,372`.
+- **A newer NG revision that knows 1.7.x is already in your local object pack**: `9955ae3b18dd0aedbebb58fa207a4b7180eb6d67` (2026-11-12, "chore(release): 16.4.0"), a descendant of `539d4ce`. [V] It defines `RUNTIME_SSE_1_7_99` and `1_7_104` (`include/SKSE/Version.h:36-37`), classes minor ≥ 6 as AE (`include/REL/Module.h:344-350`), and reads format 5 (`src/REL/IDDB.cpp:205-210,258-305`). [V] Which branch it is on: [U] (no refs in the pack). This contradicts the earlier note that NG knows no 1.7.x; that was true of the older snapshot only.
+- Its license: `vcpkg.json` says `GPL-3.0-or-later`; `COPYING.txt` is GPLv3; `EXCEPTIONS.md` carries a "Modding Exception" and a linking exception. [V] Relicensed in `cf24ab8` (2026-08-20), one day before 1.7.99 support landed (`7b47c5a`). [V] So **no MIT NG revision supports 1.7.99**. [V for this pack]
+- Format 5 as read by `NEW` [V] `include/REL/IDDB.h:222-251`, `src/REL/IDDB.cpp:274-301`: `i32 format(=5)`, `u32 version[4]`, `char name[64]`, `i32 pointerSize`, `i32 dataFormat`, `i32 offsetCount`, then `offsetCount` × `u32` indexed directly by ID; 0 means absent (`IDDB.cpp:159`). Meaning of `pointerSize`/`dataFormat`: [U] (read, never used). Same shared-mapping name is **not** used for v5; the file itself is mapped (`IDDB.cpp:265`). [V]
+- powerof3/CommonLibSSE and libxse/commonlib-shared: not in this tree, not re-verified. [U]
+
+## f. Options for targeting 1.7.99
+
+**Option 1 — host with no CommonLib link; own minimal definitions of the SKSE entry-point/interface types.**
+- Pro: the host needs no `RE::` types, no ID database, no runtime classification of its own. Small, auditable, and it sidesteps (b)'s option ambiguity. Host license stays yours to choose.
+- Pro: interface/plugin-data layouts can be written against the MIT `539d4ce` `Interfaces.h` (attributed in LICENSES.md).
+- Con: I must hand-declare `SKSEPlugin_Version`; the fields the 1.7.99 loader gates on are [U]. I need the SKSE headers for your build (`PluginAPI.h`) or you confirm the values.
+- Con: own logging, INI, PE parsing. All small; Win32 only.
+- License consequence: no GPL input. [V for the sources named]
+
+**Option 2 — update `CL/` to NG `9955ae3` and build the host on it.**
+- Pro: plugin declaration, logging, version constants come for free and are maintained upstream.
+- Con: pulls ~all of CommonLib into a DLL that uses almost none of it; adds a second ID database and Module instance in the host for no functional gain.
+- License consequence: the host links GPL-3.0-or-later code. `EXCEPTIONS.md`'s Modding Exception speaks of "Modded Code", the existing code the program is used with. Whether a host plugin falls under it or must itself be GPL-3.0-or-later is a legal question I'm flagging, not answering. Your earlier note says powerof3's exception does not cover plugin code; the NG text reads similarly. [A] Plan on the host being GPL-3.0-or-later if you pick this. The legacy plugin is not linked and is untouched either way.
+
+**Recommendation: Option 1.** The host's job is loader plumbing; CommonLib adds risk and a license decision without adding capability. `xmake.lua:6` already says GPL-3.0, so if that is deliberate the license objection to Option 2 weakens, but the engineering one stands.
+
+### 3.1 Design correction for Stage 2 (needs your decision before Step 3, not now)
+
+Given findings 0.2–0.3, a legacy plugin from the `539d4ce` lineage fails on 1.7.99 like this:
+- Case B (multi-runtime): 1.7 → SE → opens `version-1-7-99-0.bin` → fatal "failed to open address library file". [V] path as cited above.
+- Case A (AE-only): opens `versionlib-1-7-99-0.bin` → format 5 ≠ 2 → fatal "Unsupported address library format". [V]
+
+One route that stays inside your rules (import-table patching only, no AL redistribution):
+1. Version-query interposition presents **1.6.1170** to the legacy module (fixes classification and filename in both cases).
+2. The legacy code then opens the genuine `versionlib-1-6-1170-0.bin`, which **you must keep installed** alongside the 1.7.99 file. Header and format 2 pass.
+3. Mapping interposition answers `CommonLibSSEOffsets-v2-1-6-1170-0` with a private, unnamed table the host builds from the 1.7.99 format-5 file.
+
+Open issues: the table length is fixed by the 1.6.1170 header's `address_count`, so the host must fit 1.7.99 data into that many rows [A: workable, needs care with the lower_bound behavior above]; whether 1.7.99 keeps 1.6.1170 ID numbering is [U]; the plugin will believe it runs on 1.6.1170 everywhere `Module::version()` is consulted. The alternative (intercepting the file open itself) depends on whether the CRT is statically linked into the legacy DLL [U until g] and edges toward out-of-scope territory.
+
+## g. Legacy DLL inspection
+
+Not done: no path given. Tooling is ready to report exports, full import table (flagging `OpenFileMappingW`, `CreateFileMappingW`, `MapViewOfFile`, `GetFileVersionInfo*`, `VerQueryValueW`, `GetEnvironmentVariableW`, `LoadLibrary*`, plus `CreateFileW` and the CRT DLLs given 3.1), strings, decoded `SKSEPlugin_Version`, TimeDateStamp, PDB GUID/age, SHA-256, and the Case A/B classification.
+
+## Questions for Checkpoint 1
+
+1. Legacy DLL path (and grant me that folder), plus its archived SHA-256.
+2. Option 1 or Option 2?
+3. Target 1.7.99 or 1.7.104? Which SKSE build? Path to its headers if you have them.
+4. Path to the installed 1.7.99 Address Library file so I can read its header (read-only, nothing copied).
+5. Which CommonLib revision built the legacy plugin? If it is this same template, `539d4ce` applies.
+6. OK to remove the PrismaUI example code, `view/`, and the unused `ClibUtil`/`xbyak`/`simpleini` references when Stage 1 starts?
+7. Is `GPL-3.0` in `xmake.lua:6` intended for the host?
+
+## Addendum (same day) — decisions taken after "do what you think is best"
+
+- **Option 1 chosen**: host in `host/`, no CommonLib link. `xmake.lua` rewritten; `set_license('GPL-3.0')` removed, host license left open (`docs/LICENSES.md`).
+- **Legacy CommonLib revision**: the folder `lib/commonlibsse-ng/example old project lib/` is content-identical (ignoring line endings) to the vendored tree, i.e. `539d4ce`, latest runtime 1.6.1170. [V]
+- **Stages 1–3 implemented together** behind INI switches instead of stopping at each checkpoint. Design follows section 3.1. See `docs/DESIGN.md`.
+- **Section g is now performed by the host itself** at runtime (`dry_run=1` logs everything g asked for). Still not run against your real DLL: no path was given.
+- Old template files (`src/`, `view/`, `lib/`, `ClibUtil/`, `xbyak/`) were left in place, unused. Deleting them is yours to do.
+- Compile check: clean with clang 0.17.1-zig (`x86_64-windows-gnu`, `-Wall -Wextra`). **Not compiled with MSVC.** Synthetic end-to-end run under Wine: see `docs/TEST_PLAN.md`.
+
+## Addendum 2 — real Address Library files (2026-11-12, evening)
+
+Source: `Address Library/` (Address Library All in One 1.7.104.0 v13), read in place, nothing copied. Now git-ignored.
+- 1.7.99 and 1.7.104 files are **format 5** as predicted in 0.2; header layout matches section e exactly. [V]
+- **1.7.99 keeps 1.6.1170 ID numbering.** 392,696 / 428,461 IDs carried (91.7%), 97.6% identical neighbour gaps. 35,765 IDs dropped. [V] Details in `docs/DESIGN.md`.
+- Consequence: the private table is now built per legacy ID (one row per 1.6.1170 ID), replacing the earlier truncate/pad approach, which would have dropped 6,693 rows and let missing IDs resolve to a wrong neighbour.
+- Host source lives in `src/` (you had already copied it). The duplicate files from `host/` were moved to `_to_delete/host/` (git-ignored); the empty `host/` folder needs delete permission to remove.

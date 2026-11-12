@@ -12,3 +12,11 @@ vs*/
 # files
 *.zip
 compile_commands.json
+
+# Address Library data: never commit or redistribute
+Address Library/
+versionlib-*.bin
+version-*.bin
+
+# scratch
+_to_delete/
