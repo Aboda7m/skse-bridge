@@ -20,3 +20,6 @@ version-*.bin
 
 # scratch
 _to_delete/
+
+
+example-sources/

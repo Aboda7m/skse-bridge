@@ -124,3 +124,9 @@ Source: `Address Library/` (Address Library All in One 1.7.104.0 v13), read in p
 - **1.7.99 keeps 1.6.1170 ID numbering.** 392,696 / 428,461 IDs carried (91.7%), 97.6% identical neighbour gaps. 35,765 IDs dropped. [V] Details in `docs/DESIGN.md`.
 - Consequence: the private table is now built per legacy ID (one row per 1.6.1170 ID), replacing the earlier truncate/pad approach, which would have dropped 6,693 rows and let missing IDs resolve to a wrong neighbour.
 - Host source lives in `src/` (you had already copied it). The duplicate files from `host/` were moved to `_to_delete/host/` (git-ignored); the empty `host/` folder needs delete permission to remove.
+
+## Addendum 3 — first real in-game run and Stage 4 (2026-11-12, night)
+
+- In-game log (1.7.104, SKSE 2.3.1): PickPocketRedone-NG and RTL-SUPPORT-NG both reached `T1 SKSEPlugin_Load returned true`; 392,538 / 428,461 legacy IDs translated. Version spoof and private table worked as designed. [V, from your log]
+- One plugin reportedly stops working later. Cause not determined; no assumption made. Stage 4 adds the instruments to find it: offset verification, RTTI vtable scan, fault log, source checker. See `docs/DESIGN.md` "Stage 4".
+- Four renumbered functions (NG `AE_CHECK`) are now translated instead of poisoned.

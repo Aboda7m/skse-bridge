@@ -19,6 +19,27 @@ a format-5 "1.7.99" file. Run under Wine 9 with a clang/mingw build of the host.
 
 Overlay and poisoning re-run after the per-ID table change: 4 translated + 2 poisoned without overlay, 6 translated with it; missing-ID report lists exactly the 2.
 
+Stage 4 (same harness): known remaps skipped quietly when the legacy library lacks those IDs; `.check`
+report lists translated, mid-function and MISSING IDs; a read through a poisoned ID produced
+`[fault] ... inside a hosted plugin` with `rax holds a poisoned address: missing Address Library ID 441529`
+and a stack; an MSVC-ABI test DLL (built with clang `x86_64-windows-msvc`) with `class PickPocketInput :
+public RE::MenuEventHandler` produced `RTTI: INCOMPATIBLE VTABLE ... 6 slots`. Stage 5 (harness, mock SKSE that skips a second listener for the same handle, like skse64): two hosted
+plugins registering for "SKSE". `messaging_fanout=0`: second registration skipped, only the first plugin
+received message 8 (reproduces the in-game failure). `messaging_fanout=1`: one SKSE registration, both
+plugins received message 8. Stage 6 (harness): static-initializer plugin dies with the previous build (log ends at `lineage`) and
+loads with the new one (`early: ... imports bound -> patched before DllMain`). Stage 7 (harness): hosted consumer/provider pair; previous build reproduces CNO's "Failed to register
+messaging listener" and the provider's undelivered broadcast; new build routes it and `GetPluginInfo` finds
+the provider. Tail-call attribution verified (registration from `SKSEPlugin_Load` attributed correctly).
+
+Not covered: real Windows
+loader ordering (logged per load), A-variant version queries (no mock caller).
+
+Not covered: the serialization warning path (mock has no serialization).
+
+Not covered: the C++
+exception type/`what()` decoding (needs an MSVC-built thrower) and SkyrimSE.exe frame → ID mapping on
+the real exe.
+
 Not covered: the MSVC build, the SEH path, a real CommonLib plugin, the real SKSE loader, real Address Library files.
 
 ## In-game tiers
@@ -40,6 +61,16 @@ Not covered: the MSVC build, the SEH path, a real CommonLib plugin, the real SKS
 1. Same DLL directly in `Data\SKSE\Plugins` on 1.7.99, host removed: record the failure (SKSE rejection or the plugin's dialog).
 2. Host installed, `Legacy\` empty: log ends at `legacy plugins: 0`; game unaffected.
 3. `[Translate] enabled=0`: expect the plugin's own Address Library dialog.
+
+## Investigating a plugin that stops working
+
+1. Run once with the defaults. In `SKSE-Bridge.log` look for `RTTI: INCOMPATIBLE VTABLE` and `[fault]`.
+2. Reproduce the failure in game, then read the `[fault]` lines: `<plugin>.dll+0xRVA` is in your code
+   (map it with your build's .map/.pdb); `SkyrimSE.exe+0x... (ID n+0x..)` is the game function.
+3. Put the IDs your plugin uses into `Legacy\compat\<plugin>.check` and read the `check:` lines.
+4. Run `tools\check_plugin_source.py` on the plugin source.
+5. No `[fault]` and no RTTI warning yet the plugin misbehaves: likely a moved member read without an
+   exception (wrong data, not a crash). The source checker is the tool for that case.
 
 ## First run, in order
 

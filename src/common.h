@@ -2,6 +2,9 @@
 // No CommonLib dependency. Win32 + C++20 only.
 #pragma once
 
+#ifndef _WIN32_WINNT
+#	define _WIN32_WINNT 0x0A00  // GetCurrentThreadStackLimits
+#endif
 #ifndef WIN32_LEAN_AND_MEAN
 #	define WIN32_LEAN_AND_MEAN
 #endif
@@ -74,6 +77,15 @@ namespace bridge
 			       (std::uint32_t(v[2] & 0xFFF) << 4) | std::uint32_t(v[3] & 0x00F);
 		}
 		[[nodiscard]] bool operator==(const Version& o) const noexcept { return std::memcmp(v, o.v, sizeof(v)) == 0; }
+		[[nodiscard]] bool less(const Version& o) const noexcept
+		{
+			for (int i = 0; i < 4; ++i) {
+				if (v[i] != o.v[i]) {
+					return v[i] < o.v[i];
+				}
+			}
+			return false;
+		}
 		[[nodiscard]] std::wstring wstr(wchar_t sep) const;
 		[[nodiscard]] std::string  str(char sep) const;
 		static bool                parse(std::wstring_view text, Version& out);
@@ -175,6 +187,38 @@ namespace bridge
 
 	HANDLE make_mapping(const std::vector<IdEntry>& table);
 
+	using RemapRules = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+	// Functions that 1.7.99 renumbered (old ID absent from the 1.7.99 library, same function under a new ID).
+	// Empty unless legacy is 1.6.x and the game is 1.7.99 or later.
+	RemapRules known_remaps(const Version& legacy, const Version& game);
+
+	// ---- verify.cpp : checks resolved offsets against the running SkyrimSE.exe image ----
+	void verify_table(const std::vector<IdEntry>& table);
+	// compat/<plugin>.check : IDs the plugin uses (any text; every number is taken as an ID).
+	void check_ids(const std::wstring& path, const std::vector<IdEntry>& legacy, const std::vector<IdEntry>& table);
+	[[nodiscard]] std::uintptr_t exe_base();
+	[[nodiscard]] std::uint32_t  exe_size();
+
+	// ---- rtti.cpp : read-only RTTI scan of a loaded legacy module ----
+	// Reports plugin classes that derive from game interfaces whose vtable changed in 1.7.99.
+	// Returns the number of affected classes.
+	int scan_rtti(HMODULE mod, const std::string& name);
+
+	// ---- faultlog.cpp : first-chance exception attribution (log only, never handles) ----
+	void fault_log_install(const std::vector<IdEntry>& installed);
+	void fault_log_add_module(HMODULE mod, const std::string& name);
+
+	// ---- skseproxy.cpp : SKSE interfaces handed to hosted plugins ----
+	// Messaging fan-out (every hosted plugin gets every message) and co-save collision warnings.
+	void skse_proxy_init(const SKSEInterface* real, bool messagingFanout);
+	void skse_proxy_add_module(HMODULE mod, const std::string& name);
+	void* (*skse_proxy_query())(std::uint32_t);  // QueryInterface for hosted plugins; null before init
+	// Hosted plugin names (from SKSEPlugin_Version), declared before any is loaded.
+	void skse_proxy_loading(const std::string& file);  // "" when SKSEPlugin_Load returned
+	void skse_proxy_declare(const std::string& file, const std::string& pluginName, std::uint32_t version);
+	const void* (*skse_proxy_plugin_info())(const char*);  // GetPluginInfo for hosted plugins
+
 	// ---- interpose.cpp : per-module import-table interposer ----
 	struct InterposeConfig
 	{
@@ -188,9 +232,25 @@ namespace bridge
 	{
 		int getFileVersionInfoW{ 0 };
 		int verQueryValueW{ 0 };
+		int getFileVersionInfoA{ 0 };
+		int verQueryValueA{ 0 };
 		int openFileMappingW{ 0 };
 		int createFileMappingW{ 0 };
 	};
 
 	InterposeResult install_interposer(HMODULE legacy, const std::wstring& name, const InterposeConfig& cfg);
+	bool            imports_bound(HMODULE mod);
+
+	// ---- earlyload.cpp : patch a legacy module before its DllMain / static initializers run ----
+	struct EarlyResult
+	{
+		bool            available{ false };  // loader notifications could be registered
+		bool            sawModule{ false };   // notification arrived for the module
+		bool            bound{ false };       // its imports were already bound at that point
+		bool            patched{ false };     // interposer installed from the notification
+		InterposeResult r;
+	};
+	// Arm before LoadLibraryW, disarm right after it returns.
+	void        early_arm(const std::wstring& path, const std::wstring& name, const InterposeConfig& cfg, bool translate, bool faultLog);
+	EarlyResult early_disarm();
 }

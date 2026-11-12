@@ -25,6 +25,10 @@ namespace bridge
 			bool                      force{ false };
 			Version                   spoof{ { 1, 6, 1170, 0 } };
 			std::wstring              addressLibrary;  // empty = auto
+			bool                      verifyIds{ true };
+			bool                      rttiScan{ true };
+			bool                      faultLog{ true };
+			bool                      messagingFanout{ true };
 		};
 
 		struct Preflight
@@ -34,6 +38,7 @@ namespace bridge
 			Version              real{};
 			std::vector<IdEntry> legacy;   // from the legacy (1.6.1170) Address Library, sorted
 			std::vector<IdEntry> entries;  // from the installed (real) Address Library, sorted
+			RemapRules           baseRules;  // known renumbered functions + compat\_global.ids, applied to every plugin
 		};
 
 		std::wstring ini_string(const std::wstring& ini, const wchar_t* sec, const wchar_t* key, const wchar_t* def)
@@ -96,11 +101,17 @@ namespace bridge
 				logf("config: legacy_runtime \"%s\" is not a version; using 1.6.1170.0", narrow(spoof).c_str());
 				c.spoof = Version{ { 1, 6, 1170, 0 } };
 			}
+			c.verifyIds = ini_bool(ini, L"Diagnostics", L"verify_ids", true);
+			c.rttiScan = ini_bool(ini, L"Diagnostics", L"rtti_scan", true);
+			c.faultLog = ini_bool(ini, L"Diagnostics", L"fault_log", true);
+			c.messagingFanout = ini_bool(ini, L"Compatibility", L"messaging_fanout", true);
 			logf("config: dry_run=%d legacy_dir=%s plugins=%s", c.dryRun ? 1 : 0, narrow(c.legacyDir).c_str(),
 				c.plugins.empty() ? "*" : narrow(list).c_str());
 			logf("config: translate=%d legacy_runtime=%s spoof_skse_runtime=%d id_table=%d force=%d address_library=%s",
 				c.translate ? 1 : 0, c.spoof.str('.').c_str(), c.spoofSkseRuntime ? 1 : 0, c.idTable ? 1 : 0, c.force ? 1 : 0,
 				c.addressLibrary.empty() ? "(auto)" : narrow(c.addressLibrary).c_str());
+			logf("config: verify_ids=%d rtti_scan=%d fault_log=%d messaging_fanout=%d", c.verifyIds ? 1 : 0, c.rttiScan ? 1 : 0,
+				c.faultLog ? 1 : 0, c.messagingFanout ? 1 : 0);
 			return c;
 		}
 
@@ -189,6 +200,23 @@ namespace bridge
 			}
 			logf("preflight: %zu of %zu legacy IDs exist in the installed library; %zu do not (they will fault if used)",
 				carried, p.legacy.size(), p.legacy.size() - carried);
+			const auto has = [](const std::vector<IdEntry>& v, std::uint64_t id) {
+				const auto it = std::lower_bound(v.begin(), v.end(), id, [](const IdEntry& x, std::uint64_t i) { return x.id < i; });
+				return it != v.end() && it->id == id;
+			};
+			for (const auto& [from, to] : known_remaps(c.spoof, p.real)) {
+				if (has(p.legacy, from) && has(p.entries, to)) {
+					p.baseRules.emplace_back(from, to);
+					logf("preflight: known renumbered function: legacy ID %llu -> ID %llu", static_cast<unsigned long long>(from),
+						static_cast<unsigned long long>(to));
+				}
+			}
+			RemapRules global;
+			const std::wstring globalIds = c.legacyDir + L"compat\\_global.ids";
+			if (read_overlay(globalIds, global)) {
+				logf("preflight: %zu rule(s) from %s", global.size(), narrow(globalIds).c_str());
+				p.baseRules.insert(p.baseRules.end(), global.begin(), global.end());
+			}
 			p.ok = true;
 			return p;
 		}
@@ -236,7 +264,7 @@ namespace bridge
 #endif
 		}
 
-		void host_one(const Config& c, const Preflight& pf, const SKSEInterface* skse, const std::wstring& file)
+		void host_one(const Config& c, const Preflight& pf, const SKSEInterface* skse, const std::wstring& file, const PeReport& rep)
 		{
 			const std::wstring path = c.legacyDir + file;
 			logf("---- %s", narrow(path).c_str());
@@ -244,7 +272,6 @@ namespace bridge
 				logf("  SKIP: file not found");
 				return;
 			}
-			const PeReport rep = inspect_pe(path);
 			log_report(rep);
 			if (c.dryRun) {
 				logf("  dry_run: not loaded");
@@ -274,19 +301,10 @@ namespace bridge
 				}
 			}
 
-			SetLastError(0);
-			const HMODULE mod = LoadLibraryW(path.c_str());
-			const DWORD   gle = GetLastError();
-			logf("  T0 LoadLibraryW -> %p (GetLastError=%lu)", static_cast<void*>(mod), static_cast<unsigned long>(mod ? 0 : gle));
-			if (!mod) {
-				return;
-			}
-			wchar_t loadedPath[1024]{};
-			GetModuleFileNameW(mod, loadedPath, static_cast<DWORD>(std::size(loadedPath)));
-			logf("  module path: %s", narrow(loadedPath).c_str());
-
+			// Everything the interposer needs is prepared before LoadLibraryW, so it can be installed from the
+			// loader notification, ahead of the plugin's DllMain and static initializers (earlyload.cpp).
+			InterposeConfig ic;
 			if (translate) {
-				InterposeConfig ic;
 				ic.spoofVersion = true;
 				ic.spoof = c.spoof;
 				if (pf.ok && c.idTable) {
@@ -295,22 +313,56 @@ namespace bridge
 						stem.resize(dot);
 					}
 					const std::wstring overlay = c.legacyDir + L"compat\\" + stem + L".ids";
-					std::vector<std::pair<std::uint64_t, std::uint64_t>> rules;
-					const bool hasOverlay = read_overlay(overlay, rules);
-					logf("  overlay: %s", hasOverlay ? (std::to_string(rules.size()) + " rule(s) in " + narrow(overlay)).c_str() : "none");
+					RemapRules own;
+					const bool hasOverlay = read_overlay(overlay, own);
+					logf("  overlay: %s", hasOverlay ? (std::to_string(own.size()) + " rule(s) in " + narrow(overlay)).c_str() : "none");
+					RemapRules rules = pf.baseRules;
+					rules.insert(rules.end(), own.begin(), own.end());
 					TableStats st;
 					const auto table = build_legacy_table(pf.legacy, pf.entries, rules, st);
-					logf("  table: %zu rows, %zu translated, %zu missing (poisoned), %zu overlay rule(s) applied", st.rows,
+					logf("  table: %zu rows, %zu translated, %zu missing (poisoned), %zu remap rule(s) applied", st.rows,
 						st.translated, st.missing, st.overlaid);
+					check_ids(c.legacyDir + L"compat\\" + stem + L".check", pf.legacy, table);
 					ic.mapping = make_mapping(table);
 					ic.mappingBytes = table.size() * sizeof(IdEntry);
 					if (!ic.mapping) {
 						logf("  ERROR: could not create the private ID table (GetLastError=%lu)", static_cast<unsigned long>(GetLastError()));
 					}
 				}
-				const InterposeResult ir = install_interposer(mod, file, ic);
-				logf("  interposer: patched slots GetFileVersionInfoW=%d VerQueryValueW=%d OpenFileMappingW=%d CreateFileMappingW=%d",
-					ir.getFileVersionInfoW, ir.verQueryValueW, ir.openFileMappingW, ir.createFileMappingW);
+			}
+
+			early_arm(path, file, ic, translate, c.faultLog);
+			logf("  loading (DllMain and static initializers run now)");
+			SetLastError(0);
+			const HMODULE     mod = LoadLibraryW(path.c_str());
+			const DWORD       gle = GetLastError();
+			const EarlyResult early = early_disarm();
+			logf("  T0 LoadLibraryW -> %p (GetLastError=%lu)", static_cast<void*>(mod), static_cast<unsigned long>(mod ? 0 : gle));
+			if (!mod) {
+				return;
+			}
+			wchar_t loadedPath[1024]{};
+			GetModuleFileNameW(mod, loadedPath, static_cast<DWORD>(std::size(loadedPath)));
+			logf("  module path: %s", narrow(loadedPath).c_str());
+			if (!early.patched) {
+				skse_proxy_add_module(mod, narrow(file));
+				if (c.faultLog) {
+					fault_log_add_module(mod, narrow(file));
+				}
+			}
+			if (c.rttiScan) {
+				scan_rtti(mod, narrow(file));
+			}
+
+			if (translate) {
+				const InterposeResult ir = early.patched ? early.r : install_interposer(mod, file, ic);
+				logf("  interposer (%s): patched slots GetFileVersionInfoW=%d VerQueryValueW=%d GetFileVersionInfoA=%d VerQueryValueA=%d OpenFileMappingW=%d CreateFileMappingW=%d",
+					early.patched ? "early, before DllMain" : "late, after DllMain", ir.getFileVersionInfoW, ir.verQueryValueW,
+					ir.getFileVersionInfoA, ir.verQueryValueA, ir.openFileMappingW, ir.createFileMappingW);
+				if (!early.patched) {
+					logf("  note: %s; anything this plugin did with versions or IDs during DllMain/static init ran unpatched",
+						!early.available ? "loader notifications unavailable" : (!early.sawModule ? "no loader notification for this module" : "imports were not yet bound at the notification"));
+				}
 			}
 
 			const auto fn = reinterpret_cast<LoadFn>(reinterpret_cast<void*>(GetProcAddress(mod, "SKSEPlugin_Load")));
@@ -319,16 +371,24 @@ namespace bridge
 				return;
 			}
 
-			// The legacy plugin gets a copy of the host's interface. Its plugin handle is the host's:
-			// messaging sender name and co-save unique ID collapse into the host's identity.
+			// The legacy plugin gets a copy of the host's interface. Its plugin handle is the host's. SKSE keeps one
+			// listener per handle and sender, so messaging goes through the bridge's fan-out (skseproxy.cpp).
+			// Outgoing messages still carry the bridge's name; the co-save is still shared (warned, not fixed).
 			auto* iface = new SKSEInterface(*skse);  // intentionally never freed; plugins keep the pointer
+			if (const auto query = skse_proxy_query()) {
+				iface->QueryInterface = query;  // messaging fan-out + co-save monitoring
+				iface->GetPluginInfo = skse_proxy_plugin_info();  // hosted plugins can find each other by name
+			}
 			if (translate && c.spoofSkseRuntime) {
 				iface->runtimeVersion = c.spoof.pack();
 			}
 			logf("  calling SKSEPlugin_Load (runtimeVersion presented: %s)", Version::unpack(iface->runtimeVersion).str('.').c_str());
 			bool          result = false;
 			unsigned long code = 0;
-			if (call_load(fn, iface, &result, &code)) {
+			skse_proxy_loading(narrow(file));
+			const bool returned = call_load(fn, iface, &result, &code);
+			skse_proxy_loading({});
+			if (returned) {
 				logf("  T1 SKSEPlugin_Load returned %s", result ? "true" : "false");
 			} else {
 				logf("  T1 SKSEPlugin_Load raised SEH exception 0x%08lX", code);
@@ -374,6 +434,7 @@ extern "C"
 		}
 
 		const Config c = read_config();
+		skse_proxy_init(skse, c.messagingFanout);
 		logf("note: assuming SKSE does not scan sub-folders of Data\\SKSE\\Plugins [Assumption]. If skse64.log lists the legacy "
 			 "DLLs itself, move legacy_dir outside Data\\SKSE\\Plugins.");
 
@@ -392,10 +453,32 @@ extern "C"
 			logf("preflight: %s%s", pf.ok ? "ok" : "FAILED: ", pf.ok ? "" : pf.why.c_str());
 			if (pf.ok) {
 				write_missing_report(pf);
+				if (c.verifyIds) {
+					TableStats st;
+					verify_table(build_legacy_table(pf.legacy, pf.entries, pf.baseRules, st));
+				}
 			}
 		}
-		for (const auto& file : plugins) {
-			host_one(c, pf, skse, file);
+		if (c.faultLog && !c.dryRun) {
+			fault_log_install(pf.entries);
+		}
+		// Inspect everything first and declare every hosted plugin's name, so a plugin that looks for another
+		// hosted plugin (messaging sender, GetPluginInfo) finds it regardless of load order.
+		std::vector<PeReport> reports(plugins.size());
+		for (std::size_t i = 0; i < plugins.size(); ++i) {
+			const std::wstring path = c.legacyDir + plugins[i];
+			if (!file_exists(path)) {
+				continue;
+			}
+			reports[i] = inspect_pe(path);
+			if (reports[i].ok && reports[i].hasVersionData) {
+				char name[257]{};
+				std::memcpy(name, reports[i].versionData.pluginName, 256);
+				skse_proxy_declare(narrow(plugins[i]), name, reports[i].versionData.pluginVersion);
+			}
+		}
+		for (std::size_t i = 0; i < plugins.size(); ++i) {
+			host_one(c, pf, skse, plugins[i], reports[i]);
 		}
 		logf("done");
 		return true;

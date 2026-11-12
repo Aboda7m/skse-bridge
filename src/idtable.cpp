@@ -272,6 +272,23 @@ namespace bridge
 		return table;
 	}
 
+	// Source: CommonLibSSE-NG 9955ae3 (AE_CHECK(SKSE::RUNTIME_SSE_1_7_99, old, new) call sites). [Verified]
+	// Checked against Address Library v13 files: each old ID exists in 1.6.1170, is absent from 1.7.99 and
+	// 1.7.104, and each new ID exists in both. Same function signature on both sides of AE_CHECK.
+	RemapRules known_remaps(const Version& legacy, const Version& game)
+	{
+		static constexpr Version k1799{ { 1, 7, 99, 0 } };
+		if (legacy.v[0] != 1 || legacy.v[1] != 6 || game.less(k1799)) {
+			return {};
+		}
+		return {
+			{ 47286, 523983 },  // CombatUtilities GetAngleToProjectedTarget  (include/RE/C/CombatUtilities.h:15)
+			{ 82331, 524270 },  // BSScaleformManager::IsValidName            (src/RE/B/BSScaleformManager.cpp:21)
+			{ 77235, 524254 },  // BSGraphics::Renderer::RequestWindowResize  (src/RE/R/Renderer.cpp:112)
+			{ 13358, 523463 },  // TES::GetWaterHeight                        (src/RE/T/TES.cpp:209)
+		};
+	}
+
 	HANDLE make_mapping(const std::vector<IdEntry>& table)
 	{
 		const std::uint64_t bytes = static_cast<std::uint64_t>(table.size()) * sizeof(IdEntry);

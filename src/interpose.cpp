@@ -42,6 +42,7 @@ namespace bridge
 		std::vector<ModuleCtx> g_modules;
 		std::vector<const void*> g_exeBlocks;  // version-info buffers known to describe the game exe
 		wchar_t                g_spoofString[32]{};
+		char                   g_spoofStringA[32]{};
 		VS_FIXEDFILEINFO       g_spoofFixed{};
 
 		bool find_ctx(const void* addr, ModuleCtx& out)
@@ -70,12 +71,9 @@ namespace bridge
 			return s.size() >= tail.size() && iequals(s.substr(s.size() - tail.size()), tail);
 		}
 
-		BOOL WINAPI Hook_GetFileVersionInfoW(LPCWSTR file, DWORD handle, DWORD len, LPVOID data)
+		void mark_block(const ModuleCtx& ctx, LPVOID data, const char* fn)
 		{
-			const void* const caller = BRIDGE_RETURN_ADDRESS();
-			const BOOL        ok = ::GetFileVersionInfoW(file, handle, len, data);
-			ModuleCtx         ctx;
-			if (ok && data && find_ctx(caller, ctx) && ctx.cfg.spoofVersion && is_game_exe(file)) {
+			{
 				AcquireSRWLockExclusive(&g_lock);
 				bool known = false;
 				for (const void* b : g_exeBlocks) {
@@ -88,24 +86,97 @@ namespace bridge
 					g_exeBlocks.push_back(data);
 				}
 				ReleaseSRWLockExclusive(&g_lock);
-				logf("[interpose] %s: GetFileVersionInfoW(game exe) -> block %p marked for version spoof", ctx.name.c_str(), data);
+				logf("[interpose] %s: %s(game exe) -> block %p marked for version spoof", ctx.name.c_str(), fn, data);
+			}
+		}
+
+		bool is_marked(LPCVOID block)
+		{
+			bool marked = false;
+			AcquireSRWLockShared(&g_lock);
+			for (const void* b : g_exeBlocks) {
+				marked = marked || b == block;
+			}
+			ReleaseSRWLockShared(&g_lock);
+			return marked;
+		}
+
+		// VS_FIXEDFILEINFO with the spoofed version, built from the real one. Returns null if unavailable.
+		const VS_FIXEDFILEINFO* spoof_fixed(const void* real, UINT realLen, const Version& v)
+		{
+			if (!real || realLen < sizeof(VS_FIXEDFILEINFO)) {
+				return nullptr;
+			}
+			AcquireSRWLockExclusive(&g_lock);
+			g_spoofFixed = *static_cast<const VS_FIXEDFILEINFO*>(real);
+			g_spoofFixed.dwFileVersionMS = g_spoofFixed.dwProductVersionMS = MAKELONG(v.v[1], v.v[0]);
+			g_spoofFixed.dwFileVersionLS = g_spoofFixed.dwProductVersionLS = MAKELONG(v.v[3], v.v[2]);
+			ReleaseSRWLockExclusive(&g_lock);
+			return &g_spoofFixed;
+		}
+
+		BOOL WINAPI Hook_GetFileVersionInfoW(LPCWSTR file, DWORD handle, DWORD len, LPVOID data)
+		{
+			const void* const caller = BRIDGE_RETURN_ADDRESS();
+			const BOOL        ok = ::GetFileVersionInfoW(file, handle, len, data);
+			ModuleCtx         ctx;
+			if (ok && data && find_ctx(caller, ctx) && ctx.cfg.spoofVersion && is_game_exe(file)) {
+				mark_block(ctx, data, "GetFileVersionInfoW");
 			}
 			return ok;
+		}
+
+		BOOL WINAPI Hook_GetFileVersionInfoA(LPCSTR file, DWORD handle, DWORD len, LPVOID data)
+		{
+			const void* const caller = BRIDGE_RETURN_ADDRESS();
+			const BOOL        ok = ::GetFileVersionInfoA(file, handle, len, data);
+			ModuleCtx         ctx;
+			if (ok && data && file && find_ctx(caller, ctx) && ctx.cfg.spoofVersion) {
+				// ANSI path: convert with the ANSI code page, as the A API itself does.
+				wchar_t    wide[MAX_PATH]{};
+				const bool conv = MultiByteToWideChar(CP_ACP, 0, file, -1, wide, MAX_PATH) > 0;
+				if (conv && is_game_exe(wide)) {
+					mark_block(ctx, data, "GetFileVersionInfoA");
+				}
+			}
+			return ok;
+		}
+
+		BOOL WINAPI Hook_VerQueryValueA(LPCVOID block, LPCSTR sub, LPVOID* buffer, PUINT len)
+		{
+			const void* const caller = BRIDGE_RETURN_ADDRESS();
+			ModuleCtx         ctx;
+			if (!(block && sub && buffer && len && find_ctx(caller, ctx) && ctx.cfg.spoofVersion && is_marked(block))) {
+				return ::VerQueryValueA(block, sub, buffer, len);
+			}
+			const std::wstring key = widen(sub);
+			if (ends_with_i(key, L"\\ProductVersion") || ends_with_i(key, L"\\FileVersion")) {
+				*buffer = g_spoofStringA;
+				*len = static_cast<UINT>(std::strlen(g_spoofStringA) + 1);
+				logf("[interpose] %s: VerQueryValueA(\"%s\") -> \"%s\" (spoofed)", ctx.name.c_str(), sub, g_spoofStringA);
+				return TRUE;
+			}
+			if (key == L"\\") {
+				void* real = nullptr;
+				UINT  realLen = 0;
+				if (::VerQueryValueA(block, sub, &real, &realLen)) {
+					if (const auto* f = spoof_fixed(real, realLen, ctx.cfg.spoof)) {
+						*buffer = const_cast<VS_FIXEDFILEINFO*>(f);
+						*len = sizeof(VS_FIXEDFILEINFO);
+						logf("[interpose] %s: VerQueryValueA(\"\\\") -> VS_FIXEDFILEINFO %s (spoofed)", ctx.name.c_str(), ctx.cfg.spoof.str('.').c_str());
+						return TRUE;
+					}
+				}
+			}
+			logf("[interpose] %s: VerQueryValueA(\"%s\") forwarded unchanged", ctx.name.c_str(), sub);
+			return ::VerQueryValueA(block, sub, buffer, len);
 		}
 
 		BOOL WINAPI Hook_VerQueryValueW(LPCVOID block, LPCWSTR sub, LPVOID* buffer, PUINT len)
 		{
 			const void* const caller = BRIDGE_RETURN_ADDRESS();
 			ModuleCtx         ctx;
-			bool              marked = false;
-			if (block && sub && buffer && len && find_ctx(caller, ctx) && ctx.cfg.spoofVersion) {
-				AcquireSRWLockShared(&g_lock);
-				for (const void* b : g_exeBlocks) {
-					marked = marked || b == block;
-				}
-				ReleaseSRWLockShared(&g_lock);
-			}
-			if (!marked) {
+			if (!(block && sub && buffer && len && find_ctx(caller, ctx) && ctx.cfg.spoofVersion && is_marked(block))) {
 				return ::VerQueryValueW(block, sub, buffer, len);
 			}
 			const std::wstring_view key(sub);
@@ -120,14 +191,9 @@ namespace bridge
 				void*      real = nullptr;
 				UINT       realLen = 0;
 				const BOOL ok = ::VerQueryValueW(block, sub, &real, &realLen);
-				if (ok && real && realLen >= sizeof(VS_FIXEDFILEINFO)) {
-					const auto v = ctx.cfg.spoof;
-					AcquireSRWLockExclusive(&g_lock);
-					g_spoofFixed = *static_cast<const VS_FIXEDFILEINFO*>(real);
-					g_spoofFixed.dwFileVersionMS = g_spoofFixed.dwProductVersionMS = MAKELONG(v.v[1], v.v[0]);
-					g_spoofFixed.dwFileVersionLS = g_spoofFixed.dwProductVersionLS = MAKELONG(v.v[3], v.v[2]);
-					ReleaseSRWLockExclusive(&g_lock);
-					*buffer = &g_spoofFixed;
+				const auto v = ctx.cfg.spoof;
+				if (const auto* f = ok ? spoof_fixed(real, realLen, v) : nullptr) {
+					*buffer = const_cast<VS_FIXEDFILEINFO*>(f);
 					*len = sizeof(VS_FIXEDFILEINFO);
 					logf("[interpose] %s: VerQueryValueW(\"\\\") -> VS_FIXEDFILEINFO %s (spoofed)", ctx.name.c_str(),
 						v.str('.').c_str());
@@ -211,6 +277,30 @@ namespace bridge
 		}
 	}
 
+	// True once the loader has written resolved addresses into the module's import table. Before binding,
+	// each IAT slot still holds the same value as its import-name-table slot (an RVA).
+	bool imports_bound(HMODULE mod)
+	{
+		auto* const base = reinterpret_cast<const std::uint8_t*>(mod);
+		const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+		const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+		if (!dir.VirtualAddress) {
+			return true;  // nothing to bind
+		}
+		for (auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); desc->Name || desc->FirstThunk; ++desc) {
+			if (!desc->OriginalFirstThunk || !desc->FirstThunk) {
+				continue;
+			}
+			const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + desc->OriginalFirstThunk);
+			const auto* slots = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + desc->FirstThunk);
+			if (names->u1.AddressOfData) {
+				return slots->u1.Function != names->u1.AddressOfData;
+			}
+		}
+		return true;
+	}
+
 	InterposeResult install_interposer(HMODULE legacy, const std::wstring& name, const InterposeConfig& cfg)
 	{
 		InterposeResult r;
@@ -229,6 +319,9 @@ namespace bridge
 			const auto s = cfg.spoof.wstr(L'.');
 			std::wmemset(g_spoofString, 0, std::size(g_spoofString));
 			std::wmemcpy(g_spoofString, s.c_str(), std::min<std::size_t>(s.size(), std::size(g_spoofString) - 1));
+			const auto a = cfg.spoof.str('.');
+			std::memset(g_spoofStringA, 0, sizeof(g_spoofStringA));
+			std::memcpy(g_spoofStringA, a.c_str(), std::min<std::size_t>(a.size(), sizeof(g_spoofStringA) - 1));
 		}
 		g_modules.push_back(ctx);
 		ReleaseSRWLockExclusive(&g_lock);
@@ -236,6 +329,8 @@ namespace bridge
 		if (cfg.spoofVersion) {
 			r.getFileVersionInfoW = patch_iat(legacy, "GetFileVersionInfoW", reinterpret_cast<void*>(&Hook_GetFileVersionInfoW));
 			r.verQueryValueW = patch_iat(legacy, "VerQueryValueW", reinterpret_cast<void*>(&Hook_VerQueryValueW));
+			r.getFileVersionInfoA = patch_iat(legacy, "GetFileVersionInfoA", reinterpret_cast<void*>(&Hook_GetFileVersionInfoA));
+			r.verQueryValueA = patch_iat(legacy, "VerQueryValueA", reinterpret_cast<void*>(&Hook_VerQueryValueA));
 		}
 		r.openFileMappingW = patch_iat(legacy, "OpenFileMappingW", reinterpret_cast<void*>(&Hook_OpenFileMappingW));
 		r.createFileMappingW = patch_iat(legacy, "CreateFileMappingW", reinterpret_cast<void*>(&Hook_CreateFileMappingW));
