@@ -509,3 +509,26 @@ Version 0.7.1. Shadow answers moved to one JSON per plugin under `Data\SKSE\Plug
 (fields plugin, sha256, shadow_vm, note); the 0.7.0 file in the log folder is no longer read. Harness: undecided
 with ask_on_startup=0 -> off; saved true -> shadow on (redirect verified); saved for another build -> asked again;
 stale session marker -> saved yes not trusted, marker removed when nothing is shadowed.
+
+### 0.7.2 — shadow PlayerCharacter (EXPERIMENTAL)
+
+Problem [Assumption, from source]: Rain Extinguishes Fires (commonlib-shared, 1.7 layout) calls
+`player->AddEventSink<BGSActorCellEvent>()` inline (BSTEvent.h). It computes player+0x2E0; on 1.6 the source is at
+0x2D8, so the plugin locks a field that is not the source's spinlock and hangs at "Registering event listeners".
+
+Fix: the shadow engine is generalized to a table of classes (SkyrimVM, PlayerCharacter ID 403521: 1.7 adds 8 bytes
+at 0x2D8). Each class has its own region and plugin layout. Rule for accesses from game code: if the base register
+equals the shadow start, the game function got the whole object and uses the game's own layout (identity); any
+other (interior) pointer was computed by the plugin and is translated with the plugin's layout (this covers
+BSSpinLock::Lock called with &source->lock).
+
+Detection: references to 403521 (immediate 41 28 06 00) plus RTTI `BSTEventSink<BGSActorCellEvent|BGSActorDeathEvent|
+PositionPlayerEvent>`. Decision: [PlayerShadow] ini, then "shadow_player" in the per-plugin json, then ask.
+
+Harness [Verified, Wine]: REF-like mock (1.7 layout on a 1.6 game; inline push to +0x2E0, game Lock/Unlock with an
+interior pointer, game function on the whole object) writes the real source at +0x2D8, leaves +0x330 untouched,
+lock released. SkyrimVM regressions in both directions unchanged. In game: builds; needs in-game verification.
+
+Limits: only members the plugin reaches through the singleton are translated. A pointer to the player obtained
+another way (event argument, form lookup, `GetSingleton` of a different ID) is the real object and is NOT
+translated. Events later dispatched to the plugin's sink go through the game's own code and are fine.

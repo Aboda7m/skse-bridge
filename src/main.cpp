@@ -14,7 +14,7 @@ namespace bridge
 {
 	namespace
 	{
-		constexpr Version kHostVersion{ { 0, 7, 1, 0 } };
+		constexpr Version kHostVersion{ { 0, 7, 2, 0 } };
 
 		struct Config
 		{
@@ -301,8 +301,8 @@ namespace bridge
 			return r;
 		}
 
-		// Saved answer for this DLL build: 1 yes, 0 no, -1 none.
-		int read_decision(const std::wstring& file, const std::string& sha)
+		// Saved answer for this DLL build: 1 yes, 0 no, -1 none. key: "shadow_vm" or "shadow_player".
+		int read_decision(const std::wstring& file, const std::string& sha, const char* key)
 		{
 			std::vector<std::uint8_t> raw;
 			std::string               err;
@@ -312,65 +312,81 @@ namespace bridge
 			const std::string t(raw.begin(), raw.end());
 			const std::string saved = json_value(t, "sha256");
 			if (!saved.empty() && !sha.empty() && saved.substr(0, 16) != sha.substr(0, 16)) {
-				logf("  vm-shadow: saved answer is for another build of %s (sha256 %s...); asking again", narrow(file).c_str(), saved.substr(0, 16).c_str());
+				logf("  shadow: saved answers are for another build of %s (sha256 %s...); asking again", narrow(file).c_str(), saved.substr(0, 16).c_str());
 				return -1;
 			}
-			const std::string v = json_value(t, "shadow_vm");
+			const std::string v = json_value(t, key);
 			return v == "true" ? 1 : (v == "false" ? 0 : -1);
 		}
 
-		void write_decision(const std::wstring& file, const std::string& sha, bool on)
+		void write_decision(const std::wstring& file, const std::string& sha, const char* key, bool on)
 		{
-			const std::string text = "{\r\n  \"plugin\": \"" + narrow(file) + "\",\r\n  \"sha256\": \"" + sha + "\",\r\n  \"shadow_vm\": " + (on ? "true" : "false") +
-			                         ",\r\n  \"note\": \"Written by SKSE-Bridge. true = run this plugin with the shadow SkyrimVM, false = load it normally. Delete this file to be asked again.\"\r\n}\r\n";
+			int vm = read_decision(file, sha, "shadow_vm");
+			int pl = read_decision(file, sha, "shadow_player");
+			(std::string(key) == "shadow_vm" ? vm : pl) = on ? 1 : 0;
+			std::string text = "{\r\n  \"plugin\": \"" + narrow(file) + "\",\r\n  \"sha256\": \"" + sha + "\",\r\n";
+			if (vm >= 0) {
+				text += std::string("  \"shadow_vm\": ") + (vm ? "true" : "false") + ",\r\n";
+			}
+			if (pl >= 0) {
+				text += std::string("  \"shadow_player\": ") + (pl ? "true" : "false") + ",\r\n";
+			}
+			text += "  \"note\": \"Written by SKSE-Bridge. shadow_vm / shadow_player: true = run this plugin with that shadow, false = load it normally. Delete this file to be asked again.\"\r\n}\r\n";
 			write_text(shadow_dir() + file + L".json", text);
 		}
 
 		std::wstring session_marker() { return shadow_dir() + L"_session_open.txt"; }
-		bool         g_anyShadow = false;  // a plugin runs with the shadow this session
+		bool         g_anyShadow = false;  // a plugin runs with a shadow this session
 
-		// Shadow decision for one plugin: [VMShadow] <dll>=0/1, then the decisions file, then a question.
-		bool decide_shadow(const Config& c, const std::wstring& file, const PeReport& rep, bool plugin17, bool game17, bool lastCrashed)
+		// Shadow decision for one plugin and class: ini override, then the saved answer, then a question.
+		bool decide_shadow(const Config& c, ShadowClass cls, const std::wstring& file, const PeReport& rep, bool plugin17, bool game17, bool lastCrashed,
+			const std::string& why)
 		{
-			const std::wstring over = ini_string(c.ini, L"VMShadow", file.c_str(), L"");
+			const bool        vm = cls == kShadowSkyrimVM;
+			const wchar_t*    section = vm ? L"VMShadow" : L"PlayerShadow";
+			const char*       key = vm ? "shadow_vm" : "shadow_player";
+			const char*       tag = vm ? "vm-shadow" : "player-shadow";
+			const std::wstring over = ini_string(c.ini, section, file.c_str(), L"");
 			if (!over.empty()) {
 				const bool on = over == L"1" || iequals(over, L"true") || iequals(over, L"yes");
-				logf("  vm-shadow: %s by [VMShadow] %s", on ? "ON" : "off", narrow(file).c_str());
+				logf("  %s: %s by [%s] %s", tag, on ? "ON" : "off", narrow(section).c_str(), narrow(file).c_str());
 				return on;
 			}
-			const int saved = read_decision(file, rep.sha256);
+			const int saved = read_decision(file, rep.sha256, key);
 			if (saved >= 0 && !(lastCrashed && saved == 1)) {
-				logf("  vm-shadow: %s (saved answer in %s%s.json)", saved ? "ON" : "off", narrow(shadow_dir()).c_str(), narrow(file).c_str());
+				logf("  %s: %s (saved answer in %s%s.json)", tag, saved ? "ON" : "off", narrow(shadow_dir()).c_str(), narrow(file).c_str());
 				return saved == 1;
 			}
 			if (saved == 1) {
-				logf("  vm-shadow: saved answer is Yes, but the last launch with the shadow did not reach the main menu (%s exists): asking again",
+				logf("  %s: saved answer is Yes, but the last launch with a shadow did not reach the main menu (%s exists): asking again", tag,
 					narrow(session_marker()).c_str());
-			} else if (saved < 0) {
-				logf("  vm-shadow: no usable saved answer at %s%s.json", narrow(shadow_dir()).c_str(), narrow(file).c_str());
+			} else {
+				logf("  %s: no usable saved answer at %s%s.json", tag, narrow(shadow_dir()).c_str(), narrow(file).c_str());
 			}
 			if (!c.vmAsk) {
-				logf("  vm-shadow: off (undecided and ask_on_startup=0)");
+				logf("  %s: off (undecided and ask_on_startup=0)", tag);
 				return false;
 			}
-			std::wstring text = file + L" uses Skyrim's Papyrus VM object (SkyrimVM), which changed in 1.7. This DLL was built for the " +
-			                    std::wstring(plugin17 ? L"1.7" : L"1.6") + L" layout and the game is " + (game17 ? L"1.7" : L"1.6") +
-			                    L". Without help, its Papyrus functions can fail or crash.\n\n";
+			std::wstring text = file + (vm ? L" uses Skyrim's Papyrus VM object (SkyrimVM)" : L" uses the player object (PlayerCharacter: " + widen(why) + L")") +
+			                    L", which changed in 1.7. This DLL was built for the " + std::wstring(plugin17 ? L"1.7" : L"1.6") + L" layout and the game is " +
+			                    (game17 ? L"1.7" : L"1.6") + (vm ? L". Without help, its Papyrus functions can fail or crash.\n\n" :
+			                                                       L". Without help, registering for those events writes into the wrong place (hang or crash).\n\n");
 			if (lastCrashed) {
-				text += L"Note: the last session with the shadow VM did not reach a loaded game.\n\n";
+				text += L"Note: the last launch with a shadow did not reach the main menu.\n\n";
 			}
-			text += L"Run it with a shadow VM (EXPERIMENTAL)?\n\nYes = use the shadow VM\nNo = load it normally\nCancel = do not load this plugin this session (asked again next launch)\n\n"
+			text += std::wstring(L"Run it with a shadow ") + (vm ? L"VM" : L"player") +
+			        L" (EXPERIMENTAL)?\n\nYes = use the shadow\nNo = load it normally\nCancel = do not load this plugin this session (asked again next launch)\n\n"
 			        L"Your choice is saved in Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\" + file + L".json (delete it to be asked again).";
 			const int r = MessageBoxW(nullptr, text.c_str(), L"SKSE-Bridge", MB_YESNOCANCEL | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND);
 			if (r == IDCANCEL) {
-				logf("  vm-shadow: user chose Cancel: plugin not loaded this session");
+				logf("  %s: user chose Cancel: plugin not loaded this session", tag);
 				throw std::runtime_error("cancelled");
 			}
 			const bool on = r == IDYES;
 			AcquireSRWLockExclusive(&g_decLock);
-			write_decision(file, rep.sha256, on);
+			write_decision(file, rep.sha256, key, on);
 			ReleaseSRWLockExclusive(&g_decLock);
-			logf("  vm-shadow: %s (asked; saved to %s%s.json)", on ? "ON" : "off", narrow(shadow_dir()).c_str(), narrow(file).c_str());
+			logf("  %s: %s (asked; saved to %s%s.json)", tag, on ? "ON" : "off", narrow(shadow_dir()).c_str(), narrow(file).c_str());
 			return on;
 		}
 
@@ -393,32 +409,39 @@ namespace bridge
 
 		// commonlib-shared table for the running game, with the SkyrimVM singleton ID pointed at the shadow global.
 		// Format 2: sorted {id, offset} pairs (MAPPING, 16 bytes). Format 5: the file itself (header + u32 offsets).
-		HANDLE shared_table_with_shadow(const Preflight& pf, std::size_t& bytes)
+		HANDLE shared_table_with_shadow(const Preflight& pf, unsigned mask, std::size_t& bytes)
 		{
 			const std::wstring path = game_dir() + L"Data\\SKSE\\Plugins\\versionlib-" + pf.real.wstr(L'-') + L".bin";
 			const Lib&         lib = lib_for(pf.real);
-			const auto         gOff = vm_shadow_global_offset();
-			if (!lib.ok || !gOff) {
+			if (!lib.ok) {
 				return nullptr;
 			}
 			if (lib.header.format == 5) {
 				std::vector<std::uint8_t> raw;
 				std::string               err;
-				if (!read_file(path, raw, err) || gOff > 0xFFFFFFFFull) {
+				if (!read_file(path, raw, err)) {
 					return nullptr;
 				}
-				const std::size_t at = 96 + 4 * vm_singleton_id();
-				if (at + 4 > raw.size()) {
-					return nullptr;
+				for (int k = 0; k < kShadowClassCount; ++k) {
+					const auto gOff = shadow_global_offset(static_cast<ShadowClass>(k));
+					const std::size_t at = 96 + 4 * shadow_id(static_cast<ShadowClass>(k));
+					if (!(mask & (1u << k))) {
+						continue;
+					}
+					if (!gOff || gOff > 0xFFFFFFFFull || at + 4 > raw.size()) {
+						return nullptr;
+					}
+					*reinterpret_cast<std::uint32_t*>(&raw[at]) = static_cast<std::uint32_t>(gOff);
 				}
-				*reinterpret_cast<std::uint32_t*>(&raw[at]) = static_cast<std::uint32_t>(gOff);
 				bytes = raw.size();
 				return mapping_from_bytes(raw.data(), raw.size());
 			}
 			std::vector<IdEntry> t = lib.entries;
 			for (auto& e : t) {
-				if (e.id == vm_singleton_id()) {
-					e.offset = gOff;
+				for (int k = 0; k < kShadowClassCount; ++k) {
+					if ((mask & (1u << k)) && e.id == shadow_id(static_cast<ShadowClass>(k))) {
+						e.offset = shadow_global_offset(static_cast<ShadowClass>(k));
+					}
 				}
 			}
 			bytes = t.size() * sizeof(IdEntry);
@@ -569,44 +592,59 @@ namespace bridge
 				return;
 			}
 
-			// SkyrimVM layout (vmshadow.cpp): static evidence, then the shadow decision.
-			bool shadowVm = false;
-			bool plugin17 = plan.target.at_least(1, 7, 99);
+			// Shadow objects (vmshadow.cpp): static evidence, then one decision per class.
+			unsigned shadowMask = 0;
+			bool     plugin17 = plan.target.at_least(1, 7, 99);
 			if (pf.ok && c.vmShadow) {
 				const VmScan vs = scan_vm_layout(path);
+				if (vs.layout) {
+					plugin17 = vs.layout == 17;
+				}
+				const bool game17 = pf.real.at_least(1, 7, 99);
 				if (vs.idRefs) {
-					if (vs.layout) {
-						plugin17 = vs.layout == 17;
-					}
 					std::string sites;
 					for (std::size_t i = 0; i < vs.sites.size() && i < 8; ++i) {
 						char b[24];
 						std::snprintf(b, sizeof(b), " +0x%X", vs.sites[i]);
 						sites += b;
 					}
-					const bool game17 = pf.real.at_least(1, 7, 99);
 					logf("  SkyrimVM: %u reference(s) to the singleton ID; reads at +0x200: %u, +0x210: %u ->%s layout %s (%s)%s", vs.idRefs, vs.votes16,
-						vs.votes17, vs.layout ? "" : " assumed", plugin17 ? "1.7" : "1.6", vs.layout ? "code evidence" : "from target version",
-						sites.c_str());
-					if (plugin17 != game17) {
-						const bool lastCrashed = file_exists(session_marker());
-						try {
-							shadowVm = decide_shadow(c, file, rep, plugin17, game17, lastCrashed);
-						} catch (const std::exception&) {
-							return;
+						vs.votes17, vs.layout ? "" : " assumed", plugin17 ? "1.7" : "1.6", vs.layout ? "code evidence" : "from target version", sites.c_str());
+				}
+				std::string sinks;
+				for (const auto& e : vs.playerSinks) {
+					sinks += (sinks.empty() ? "" : ", ") + e;
+				}
+				if (vs.playerRefs && !vs.playerSinks.empty()) {
+					logf("  PlayerCharacter: %u reference(s) to the singleton ID; sinks for player event sources that moved in 1.7.99: %s (layout %s)",
+						vs.playerRefs, sinks.c_str(), plugin17 ? "1.7" : "1.6");
+				}
+				const bool wantVm = vs.idRefs && plugin17 != game17;
+				const bool wantPlayer = vs.playerRefs && !vs.playerSinks.empty() && plugin17 != game17;
+				if (vs.idRefs && !wantVm) {
+					logf("  SkyrimVM: same layout as the game; no shadow needed");
+				}
+				if (wantVm || wantPlayer) {
+					const bool lastCrashed = file_exists(session_marker());
+					try {
+						if (wantVm && decide_shadow(c, kShadowSkyrimVM, file, rep, plugin17, game17, lastCrashed, {}) &&
+							shadow_init(kShadowSkyrimVM, pf.real, pf.entries)) {
+							shadowMask |= 1u << kShadowSkyrimVM;
 						}
-						if (shadowVm && !vm_shadow_init(pf.real, pf.entries)) {
-							shadowVm = false;
+						if (wantPlayer && decide_shadow(c, kShadowPlayer, file, rep, plugin17, game17, lastCrashed, "event sinks " + sinks) &&
+							shadow_init(kShadowPlayer, pf.real, pf.entries)) {
+							shadowMask |= 1u << kShadowPlayer;
 						}
-						if (shadowVm) {
-							write_text(session_marker(), "A launch with a shadowed plugin has not reached the main menu (kDataLoaded) yet.\r\n");
-							g_anyShadow = true;
-						}
-					} else {
-						logf("  SkyrimVM: same layout as the game; no shadow needed");
+					} catch (const std::exception&) {
+						return;
+					}
+					if (shadowMask) {
+						write_text(session_marker(), "A launch with a shadowed plugin has not reached the main menu (kDataLoaded) yet.\r\n");
+						g_anyShadow = true;
 					}
 				}
 			}
+			bool shadowVm = shadowMask != 0;
 
 			InterposeConfig ic;
 			ic.spoofVersion = false;  // set below when translated
@@ -649,11 +687,15 @@ namespace bridge
 						pf.globalRules.size(), own.size(), hasOverlay ? narrow(overlay).c_str() : "no overlay");
 					TableStats st;
 					auto       table = build_legacy_table(targetLib->entries, pf.entries, rules, st);
-					if (shadowVm) {
+					for (int k = 0; k < kShadowClassCount; ++k) {
+						if (!(shadowMask & (1u << k))) {
+							continue;
+						}
 						for (auto& e : table) {
-							if (e.id == vm_singleton_id()) {
-								e.offset = vm_shadow_global_offset();
-								logf("  vm-shadow: ID %llu in this plugin's table -> shadow global", static_cast<unsigned long long>(e.id));
+							if (e.id == shadow_id(static_cast<ShadowClass>(k))) {
+								e.offset = shadow_global_offset(static_cast<ShadowClass>(k));
+								logf("  shadow: ID %llu (%s) in this plugin's table -> shadow global", static_cast<unsigned long long>(e.id),
+									shadow_name(static_cast<ShadowClass>(k)));
 							}
 						}
 					}
@@ -697,12 +739,13 @@ namespace bridge
 
 			if (shadowVm && !plan.translate) {
 				if (rep.strIddbShared) {
-					ic.sharedMapping = shared_table_with_shadow(pf, ic.sharedBytes);
-					logf("  vm-shadow: commonlib-shared table for %s %s", pf.real.str('.').c_str(), ic.sharedMapping ? "prepared" : "FAILED (shadow off)");
+					ic.sharedMapping = shared_table_with_shadow(pf, shadowMask, ic.sharedBytes);
+					logf("  shadow: commonlib-shared table for %s %s", pf.real.str('.').c_str(), ic.sharedMapping ? "prepared" : "FAILED (shadow off)");
 				}
 				if (!ic.sharedMapping) {
-					logf("  vm-shadow: the bridge does not answer this plugin's Address Library loader; shadow not possible");
+					logf("  shadow: the bridge does not answer this plugin's Address Library loader; shadow not possible");
 					shadowVm = false;
+					shadowMask = 0;
 				}
 			}
 
@@ -727,7 +770,7 @@ namespace bridge
 				}
 			}
 			if (shadowVm) {
-				vm_shadow_add_module(mod, narrow(file), plugin17);
+				shadow_add_module(mod, narrow(file), plugin17, shadowMask);
 			}
 			if (c.rttiScan) {
 				scan_rtti(mod, narrow(file), direction);

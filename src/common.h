@@ -300,7 +300,13 @@ namespace bridge
 	void patch_audit_allow(const std::string& module, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& sites);
 	void patch_audit_flush(const char* when, const std::string& onlyModule = {});  // logs writes whose protection was never restored, and a summary
 
-	// ---- vmshadow.cpp : EXPERIMENTAL shadow SkyrimVM (layout translation for the 1.7.99 SkyrimVM change) ----
+	// ---- vmshadow.cpp : EXPERIMENTAL shadow objects (layout translation for classes that grew in 1.7.99) ----
+	enum ShadowClass : int
+	{
+		kShadowSkyrimVM = 0,
+		kShadowPlayer = 1,
+		kShadowClassCount = 2
+	};
 	struct VmScan
 	{
 		unsigned                   idRefs{ 0 };   // immediates 400475 (SkyrimVM singleton ID) in code
@@ -308,14 +314,17 @@ namespace bridge
 		unsigned                   votes17{ 0 };  // ... followed by mov r64,[r64+0x210]
 		int                        layout{ 0 };   // 16, 17 or 0 (no evidence)
 		std::vector<std::uint32_t> sites;         // RVAs of those reads
+		unsigned                   playerRefs{ 0 };            // immediates 403521 (PlayerCharacter singleton ID)
+		std::vector<std::string>   playerSinks;                // sinks for player event sources that moved in 1.7.99
 	};
 	VmScan        scan_vm_layout(const std::wstring& path);
-	bool          vm_shadow_init(const Version& game, const std::vector<IdEntry>& gameLib);
-	std::uint64_t vm_shadow_global_offset();  // what the plugin's table gives for the singleton ID
-	std::uint64_t vm_singleton_id();
-	void          vm_shadow_add_module(HMODULE mod, const std::string& name, bool layout17);
+	bool          shadow_init(ShadowClass cls, const Version& game, const std::vector<IdEntry>& gameLib);
+	std::uint64_t shadow_global_offset(ShadowClass cls);  // what the plugin's table gives for the class ID
+	std::uint64_t shadow_id(ShadowClass cls);
+	const char*   shadow_name(ShadowClass cls);
+	void          shadow_add_module(HMODULE mod, const std::string& name, bool layout17, unsigned classes);
 	void          vm_shadow_report(const char* when);
-	void          vm_session_reached_game();  // main.cpp: clears the crash marker of the decisions file
+	void          vm_session_reached_game();  // main.cpp: clears the crash marker
 
 	// ---- earlyload.cpp : patch a legacy module before its DllMain / static initializers run ----
 	struct EarlyResult

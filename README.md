@@ -95,6 +95,12 @@ own code.
 - **Newer plugins on an older game.** A plugin built for 1.7 on a 1.6 game, or for 1.6.1170 on 1.6.640, has the
   newer structure layouts compiled in. ID translation and the log help; the layouts still need a rebuild.
 
+## What's new in 0.7.2 (experimental)
+
+- Shadow PlayerCharacter: fixes plugins built for 1.7 that hang while registering player event sinks on 1.6
+  (e.g. Rain Extinguishes Fires stuck at "Registering event listeners"). Opt-in per plugin: answer Yes to the
+  "shadow player" question, or set `[PlayerShadow] <dll>=1`. Builds; needs in-game verification.
+
 ## What's new in 0.7.1 (experimental)
 
 - Shadow VM answers are now one file per plugin in `Data\SKSE\Plugins\SKSE-Bridge\ShadowVM\<plugin>.dll.json`

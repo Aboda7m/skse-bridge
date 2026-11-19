@@ -22,43 +22,59 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <initializer_list>
 #include <string>
 
 namespace bridge
 {
 	namespace
 	{
-		constexpr std::uint64_t kVmSingletonId = 400475;  // RELOCATION_ID(514315, 400475): SkyrimVM** (CommonLibSSE-NG, commonlib-shared)
-		constexpr std::uint64_t kInsertAt = 0x180;
-		constexpr std::uint64_t kInserted = 0x10;
-		constexpr std::size_t   kSize16 = 0x8978;
-		constexpr std::size_t   kSize17 = 0x8988;
-		constexpr std::size_t   kPage = 0x1000;
+		constexpr std::size_t kPage = 0x1000;
+
+		// One entry per shadowable class. Every member from insertAt moved by `inserted` bytes in 1.7.99.
+		struct ClassDef
+		{
+			const char*   name;
+			std::uint64_t id;        // Address Library ID of the global holding the object pointer (same in 1.6 and 1.7)
+			std::uint64_t insertAt;
+			std::uint64_t inserted;
+			std::size_t   bytes;     // shadow span (>= object size in both layouts)
+		};
+		constexpr ClassDef kClasses[kShadowClassCount] = {
+			// RELOCATION_ID(514315, 400475) SkyrimVM**; two amiibo sinks at 0x180 (alloc 0x8978 -> 0x8988) [Verified]
+			{ "SkyrimVM", 400475, 0x180, 0x10, 0x9000 },
+			// RELOCATION_ID(517014, 403521) NiPointer<PlayerCharacter>*; BSTEventSink<BSSystemEvent> at 0x2D8, everything
+			// after +8 (event sources 0x2D8/0x330/0x388 -> 0x2E0/0x338/0x390, runtime data 0x3D8 -> 0x3E0) [NG 16.9.0]
+			{ "PlayerCharacter", 403521, 0x2D8, 0x8, 0x2000 },
+		};
 
 		struct Region
 		{
-			std::uint8_t* base{ nullptr };  // page 0: C (readable cell holding S), page 1: G, then S, then dummy page
-			std::uint8_t* cell{ nullptr };
-			std::uint8_t* g{ nullptr };
-			std::uint8_t* s{ nullptr };
-			std::uint8_t* dummy{ nullptr };
-			std::size_t   sBytes{ 0 };
-			std::size_t   total{ 0 };
-		} g_r;
+			std::uint8_t*  base{ nullptr };  // page 0: C (readable cell holding S), page 1: G, then S, then dummy page
+			std::uint8_t*  cell{ nullptr };
+			std::uint8_t*  g{ nullptr };
+			std::uint8_t*  s{ nullptr };
+			std::uint8_t*  dummy{ nullptr };
+			std::size_t    sBytes{ 0 };
+			std::size_t    total{ 0 };
+			std::uintptr_t realGlobal{ 0 };  // exe + offset of the class ID in the game's library
+			bool           ready{ false };
+			int            pluginLayout{ -1 };  // layout of the plugins using this shadow (1 = 1.7), for game-side interior accesses
+		} g_regions[kShadowClassCount];
 
 		struct ModLayout
 		{
 			std::uintptr_t begin, end;
 			std::string    name;
 			bool           layout17;
+			unsigned       classes;  // bit per ShadowClass
 		};
 
 		SRWLOCK                 g_lock = SRWLOCK_INIT;
 		std::vector<ModLayout>  g_mods;
-		std::uintptr_t          g_realGlobal = 0;  // exe + offset of ID 400475 in the game's library
 		bool                    g_game17 = false;
 		PVOID                   g_veh = nullptr;
-		bool                    g_ready = false;
+		bool                    g_ready = false;  // at least one class is ready
 		volatile LONG64         g_faults = 0, g_unresolved = 0, g_gameSide = 0, g_gReads = 0;
 
 		struct Stat
@@ -68,7 +84,7 @@ namespace bridge
 			bool               write{ false };
 			std::uintptr_t     firstRip{ 0 };
 		};
-		std::map<std::pair<std::string, std::uint64_t>, Stat> g_stats;  // (module, plugin offset)
+		std::map<std::pair<std::string, std::uint64_t>, Stat> g_stats;  // (class/module, plugin offset)
 		unsigned                                              g_logged = 0;
 
 		struct Pending
@@ -182,28 +198,29 @@ namespace bridge
 		}
 
 		// Plugin-layout offset -> this runtime's offset; false when the member does not exist here.
-		bool map_offset(std::uint64_t o, bool plugin17, std::uint64_t& out)
+		bool map_offset(const ClassDef& k, std::uint64_t o, bool plugin17, std::uint64_t& out)
 		{
-			if (plugin17 == g_game17 || o < kInsertAt) {
+			if (plugin17 == g_game17 || o < k.insertAt) {
 				out = o;
 				return true;
 			}
-			if (!plugin17) {  // 1.6 plugin on 1.7: everything from 0x180 moved up
-				out = o + kInserted;
+			if (!plugin17) {  // 1.6 plugin on 1.7: everything from insertAt moved up
+				out = o + k.inserted;
 				return true;
 			}
-			if (o < kInsertAt + kInserted) {  // 1.7 plugin on 1.6: the inserted sinks do not exist
+			if (o < k.insertAt + k.inserted) {  // 1.7 plugin on 1.6: the inserted member does not exist
 				return false;
 			}
-			out = o - kInserted;
+			out = o - k.inserted;
 			return true;
 		}
 
-		bool rebase(CONTEXT* c, std::uintptr_t fault, std::uintptr_t target)
+		// The register that holds the pointer the instruction dereferences (base, else a scale-1 index), or -1.
+		int pick_reg(CONTEXT* c, std::uintptr_t fault)
 		{
 			int base, index, scale;
 			if (!operand_regs(reinterpret_cast<const std::uint8_t*>(c->Rip), base, index, scale)) {
-				return false;
+				return -1;
 			}
 			const auto near_fault = [&](int r) {
 				if (r < 0) {
@@ -212,8 +229,16 @@ namespace bridge
 				const DWORD64 v = *reg_ptr(c, r);
 				return v + 0x100000 >= fault && v <= fault + 0x100000;
 			};
-			int reg = near_fault(base) ? base : (scale == 1 && near_fault(index) ? index : -1);
-			if (reg < 0 || reg == 4) {
+			const int reg = near_fault(base) ? base : (scale == 1 && near_fault(index) ? index : -1);
+			return reg == 4 ? -1 : reg;
+		}
+
+		bool rebase(CONTEXT* c, std::uintptr_t fault, std::uintptr_t target, int reg = -2)
+		{
+			if (reg == -2) {
+				reg = pick_reg(c, fault);
+			}
+			if (reg < 0) {
 				return false;
 			}
 			DWORD64* rp = reg_ptr(c, reg);
@@ -244,56 +269,73 @@ namespace bridge
 			}
 			const auto fault = static_cast<std::uintptr_t>(er->ExceptionInformation[1]);
 			const bool write = er->ExceptionInformation[0] == 1;
-			const auto rbase = reinterpret_cast<std::uintptr_t>(g_r.base);
-			if (!g_ready || fault < rbase || fault >= rbase + g_r.total) {
+			if (!g_ready) {
 				return EXCEPTION_CONTINUE_SEARCH;
 			}
+			int cls = -1;
+			for (int i = 0; i < kShadowClassCount; ++i) {
+				const auto rb = reinterpret_cast<std::uintptr_t>(g_regions[i].base);
+				if (g_regions[i].ready && fault >= rb && fault < rb + g_regions[i].total) {
+					cls = i;
+					break;
+				}
+			}
+			if (cls < 0) {
+				return EXCEPTION_CONTINUE_SEARCH;
+			}
+			Region&         r = g_regions[cls];
+			const ClassDef& k = kClasses[cls];
 
-			// G: the singleton global as the plugin sees it.
-			if (fault >= reinterpret_cast<std::uintptr_t>(g_r.g) && fault < reinterpret_cast<std::uintptr_t>(g_r.g) + kPage) {
+			// G: the global as the plugin sees it.
+			if (fault >= reinterpret_cast<std::uintptr_t>(r.g) && fault < reinterpret_cast<std::uintptr_t>(r.g) + kPage) {
 				InterlockedIncrement64(&g_gReads);
-				const bool live = *reinterpret_cast<void* volatile*>(g_realGlobal) != nullptr;
-				const auto target = live ? reinterpret_cast<std::uintptr_t>(g_r.cell) + (fault - reinterpret_cast<std::uintptr_t>(g_r.g)) :
-				                           g_realGlobal + (fault - reinterpret_cast<std::uintptr_t>(g_r.g));
+				const bool live = *reinterpret_cast<void* volatile*>(r.realGlobal) != nullptr;
+				const auto target = live ? reinterpret_cast<std::uintptr_t>(r.cell) + (fault - reinterpret_cast<std::uintptr_t>(r.g)) :
+				                           r.realGlobal + (fault - reinterpret_cast<std::uintptr_t>(r.g));
 				if (write || !rebase(c, fault, target)) {
 					InterlockedIncrement64(&g_unresolved);
-					logf("[vm-shadow] unresolved %s of the singleton global at RIP %p", write ? "write" : "read", reinterpret_cast<void*>(c->Rip));
+					logf("[shadow] unresolved %s of the %s global at RIP %p", write ? "write" : "read", k.name, reinterpret_cast<void*>(c->Rip));
 					return EXCEPTION_CONTINUE_SEARCH;
 				}
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
 
-			const auto sb = reinterpret_cast<std::uintptr_t>(g_r.s);
-			if (fault < sb || fault >= sb + g_r.sBytes) {
+			const auto sb = reinterpret_cast<std::uintptr_t>(r.s);
+			if (fault < sb || fault >= sb + r.sBytes) {
 				return EXCEPTION_CONTINUE_SEARCH;
 			}
 			InterlockedIncrement64(&g_faults);
 			const std::uint64_t o = fault - sb;
+			const int           reg = pick_reg(c, fault);
 			AcquireSRWLockShared(&g_lock);
 			const ModLayout* m = mod_for(static_cast<std::uintptr_t>(c->Rip));
 			ReleaseSRWLockShared(&g_lock);
 			bool plugin17;
+			bool gameWhole = false;
 			if (m) {
 				plugin17 = m->layout17;
 				t_lastLayout = plugin17 ? 1 : 0;
 			} else {
 				InterlockedIncrement64(&g_gameSide);
-				plugin17 = t_lastLayout >= 0 ? t_lastLayout == 1 : !g_game17;
+				// Game code on the whole object (this == S): it uses its own layout. On an interior pointer the plugin
+				// computed (an event source, a lock): the plugin's layout.
+				gameWhole = reg >= 0 && *reg_ptr(c, reg) == sb;
+				plugin17 = gameWhole ? g_game17 : (r.pluginLayout >= 0 ? r.pluginLayout == 1 : (t_lastLayout >= 0 ? t_lastLayout == 1 : !g_game17));
 			}
-			const auto real = *reinterpret_cast<std::uint8_t* volatile*>(g_realGlobal);
+			const auto    real = *reinterpret_cast<std::uint8_t* volatile*>(r.realGlobal);
 			std::uint64_t ro = 0;
-			const bool    exists = map_offset(o, plugin17, ro);
+			const bool    exists = map_offset(k, o, plugin17, ro);
 			std::uintptr_t target;
 			if (!real) {
-				target = reinterpret_cast<std::uintptr_t>(g_r.dummy) + (o & (kPage - 1) & ~0xFull);
+				target = reinterpret_cast<std::uintptr_t>(r.dummy) + (o & (kPage - 1) & ~0xFull);
 			} else if (!exists) {
-				target = reinterpret_cast<std::uintptr_t>(g_r.dummy) + (o & 0xF);
+				target = reinterpret_cast<std::uintptr_t>(r.dummy) + (o & 0xF);
 			} else {
 				target = reinterpret_cast<std::uintptr_t>(real) + ro;
 			}
 
 			{
-				const std::string name = m ? m->name : std::string("<game code>");
+				const std::string name = std::string(k.name) + " " + (m ? m->name : (gameWhole ? std::string("<game code, whole object>") : std::string("<game code>")));
 				AcquireSRWLockExclusive(&g_lock);
 				Stat& st = g_stats[{ name, o }];
 				const bool first = st.count++ == 0;
@@ -308,17 +350,17 @@ namespace bridge
 				}
 				ReleaseSRWLockExclusive(&g_lock);
 				if (doLog) {
-					logf("[vm-shadow] %s %s SkyrimVM+0x%llX (%s layout) -> %s at RIP %p", name.c_str(), write ? "writes" : "reads",
-						static_cast<unsigned long long>(o), plugin17 ? "1.7" : "1.6",
-						!real ? "dummy (game has no VM yet)" :
-						!exists ? "dummy (member does not exist in this runtime)" :
-						("real +0x" + [&] { char b[24]; std::snprintf(b, sizeof(b), "%llX", static_cast<unsigned long long>(ro)); return std::string(b); }()).c_str(),
+					char ro_s[32];
+					std::snprintf(ro_s, sizeof(ro_s), "real +0x%llX", static_cast<unsigned long long>(ro));
+					logf("[shadow] %s %s %s+0x%llX (%s layout) -> %s at RIP %p", m ? m->name.c_str() : (gameWhole ? "<game code, whole object>" : "<game code>"),
+						write ? "writes" : "reads", k.name, static_cast<unsigned long long>(o), plugin17 ? "1.7" : "1.6",
+						!real ? "dummy (object not created yet)" : !exists ? "dummy (member does not exist in this runtime)" : ro_s,
 						reinterpret_cast<void*>(c->Rip));
 				}
 			}
-			if (!rebase(c, fault, target)) {
+			if (!rebase(c, fault, target, reg)) {
 				InterlockedIncrement64(&g_unresolved);
-				logf("[vm-shadow] UNRESOLVED instruction at RIP %p (bytes %02X %02X %02X %02X %02X %02X): left to fault", reinterpret_cast<void*>(c->Rip),
+				logf("[shadow] UNRESOLVED instruction on %s at RIP %p (bytes %02X %02X %02X %02X %02X %02X): left to fault", k.name, reinterpret_cast<void*>(c->Rip),
 					reinterpret_cast<const std::uint8_t*>(c->Rip)[0], reinterpret_cast<const std::uint8_t*>(c->Rip)[1],
 					reinterpret_cast<const std::uint8_t*>(c->Rip)[2], reinterpret_cast<const std::uint8_t*>(c->Rip)[3],
 					reinterpret_cast<const std::uint8_t*>(c->Rip)[4], reinterpret_cast<const std::uint8_t*>(c->Rip)[5]);
@@ -340,54 +382,66 @@ namespace bridge
 		}
 	}
 
-	bool vm_shadow_init(const Version& game, const std::vector<IdEntry>& gameLib)
+	bool shadow_init(ShadowClass cls, const Version& game, const std::vector<IdEntry>& gameLib)
 	{
-		if (g_ready) {
+		Region&         r = g_regions[cls];
+		const ClassDef& k = kClasses[cls];
+		if (r.ready) {
 			return true;
 		}
-		const auto it = std::lower_bound(gameLib.begin(), gameLib.end(), kVmSingletonId, [](const IdEntry& e, std::uint64_t v) { return e.id < v; });
-		if (it == gameLib.end() || it->id != kVmSingletonId) {
-			logf("[vm-shadow] ID %llu not in this game's Address Library; shadow unavailable", static_cast<unsigned long long>(kVmSingletonId));
+		const auto it = std::lower_bound(gameLib.begin(), gameLib.end(), k.id, [](const IdEntry& e, std::uint64_t v) { return e.id < v; });
+		if (it == gameLib.end() || it->id != k.id) {
+			logf("[shadow] %s: ID %llu not in this game's Address Library; shadow unavailable", k.name, static_cast<unsigned long long>(k.id));
 			return false;
 		}
 		g_game17 = game.at_least(1, 7, 99);
-		g_realGlobal = exe_base() + it->offset;
-		g_r.sBytes = (std::max(kSize16, kSize17) + kPage - 1) & ~(kPage - 1);
-		g_r.total = kPage * 2 + g_r.sBytes + kPage;
-		g_r.base = alloc_near_exe(g_r.total);
-		if (!g_r.base) {
-			logf("[vm-shadow] could not reserve memory near the game image; shadow unavailable");
+		r.realGlobal = exe_base() + it->offset;
+		r.sBytes = (k.bytes + kPage - 1) & ~(kPage - 1);
+		r.total = kPage * 2 + r.sBytes + kPage;
+		r.base = alloc_near_exe(r.total);
+		if (!r.base) {
+			logf("[shadow] %s: could not reserve memory near the game image; shadow unavailable", k.name);
 			return false;
 		}
-		g_r.cell = g_r.base;
-		g_r.g = g_r.base + kPage;
-		g_r.s = g_r.base + 2 * kPage;
-		g_r.dummy = g_r.s + g_r.sBytes;
-		*reinterpret_cast<std::uint8_t**>(g_r.cell) = g_r.s;
+		r.cell = r.base;
+		r.g = r.base + kPage;
+		r.s = r.base + 2 * kPage;
+		r.dummy = r.s + r.sBytes;
+		*reinterpret_cast<std::uint8_t**>(r.cell) = r.s;
 		DWORD old = 0;
-		VirtualProtect(g_r.g, kPage + g_r.sBytes, PAGE_NOACCESS, &old);
-		g_veh = AddVectoredExceptionHandler(1, &on_exception);
-		g_ready = g_veh != nullptr;
-		logf("[vm-shadow] EXPERIMENTAL shadow SkyrimVM ready: game layout %s, global %p (real global SkyrimSE.exe+0x%llX), shadow %p (+0x%zX)",
-			g_game17 ? "1.7" : "1.6", static_cast<void*>(g_r.g), static_cast<unsigned long long>(it->offset), static_cast<void*>(g_r.s), g_r.sBytes);
-		return g_ready;
+		VirtualProtect(r.g, kPage + r.sBytes, PAGE_NOACCESS, &old);
+		if (!g_veh) {
+			g_veh = AddVectoredExceptionHandler(1, &on_exception);
+		}
+		r.ready = g_veh != nullptr;
+		g_ready = g_ready || r.ready;
+		logf("[shadow] EXPERIMENTAL shadow %s ready: game layout %s, global %p (real global SkyrimSE.exe+0x%llX), shadow %p (+0x%zX)", k.name,
+			g_game17 ? "1.7" : "1.6", static_cast<void*>(r.g), static_cast<unsigned long long>(it->offset), static_cast<void*>(r.s), r.sBytes);
+		return r.ready;
 	}
 
-	std::uint64_t vm_shadow_global_offset()
+	std::uint64_t shadow_global_offset(ShadowClass cls)
 	{
-		return g_ready ? reinterpret_cast<std::uintptr_t>(g_r.g) - exe_base() : 0;
+		return g_regions[cls].ready ? reinterpret_cast<std::uintptr_t>(g_regions[cls].g) - exe_base() : 0;
 	}
 
-	std::uint64_t vm_singleton_id() { return kVmSingletonId; }
+	std::uint64_t shadow_id(ShadowClass cls) { return kClasses[cls].id; }
+	const char*   shadow_name(ShadowClass cls) { return kClasses[cls].name; }
 
-	void vm_shadow_add_module(HMODULE mod, const std::string& name, bool layout17)
+	void shadow_add_module(HMODULE mod, const std::string& name, bool layout17, unsigned classes)
 	{
 		const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod);
 		const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(reinterpret_cast<const std::uint8_t*>(mod) + dos->e_lfanew);
 		AcquireSRWLockExclusive(&g_lock);
-		g_mods.push_back({ reinterpret_cast<std::uintptr_t>(mod), reinterpret_cast<std::uintptr_t>(mod) + nt->OptionalHeader.SizeOfImage, name, layout17 });
+		g_mods.push_back({ reinterpret_cast<std::uintptr_t>(mod), reinterpret_cast<std::uintptr_t>(mod) + nt->OptionalHeader.SizeOfImage, name, layout17, classes });
+		for (int i = 0; i < kShadowClassCount; ++i) {
+			if (classes & (1u << i)) {
+				g_regions[i].pluginLayout = layout17 ? 1 : 0;
+			}
+		}
 		ReleaseSRWLockExclusive(&g_lock);
-		logf("[vm-shadow] %s uses the shadow with the %s SkyrimVM layout", name.c_str(), layout17 ? "1.7" : "1.6");
+		logf("[shadow] %s uses the shadow(s)%s%s with the %s layout", name.c_str(), (classes & 1) ? " SkyrimVM" : "", (classes & 2) ? " PlayerCharacter" : "",
+			layout17 ? "1.7" : "1.6");
 	}
 
 	void vm_shadow_report(const char* when)
@@ -395,11 +449,11 @@ namespace bridge
 		if (!g_ready) {
 			return;
 		}
-		logf("[vm-shadow] summary (%s): %lld member access(es), %lld singleton read(s), %lld from game code, %lld unresolved", when,
+		logf("[shadow] summary (%s): %lld member access(es), %lld global read(s), %lld from game code, %lld unresolved", when,
 			static_cast<long long>(g_faults), static_cast<long long>(g_gReads), static_cast<long long>(g_gameSide), static_cast<long long>(g_unresolved));
 		AcquireSRWLockShared(&g_lock);
-		for (const auto& [k, st] : g_stats) {
-			logf("[vm-shadow]   %s SkyrimVM+0x%llX -> +0x%llX %s x%llu (first at %p)", k.first.c_str(), static_cast<unsigned long long>(k.second),
+		for (const auto& [key, st] : g_stats) {
+			logf("[shadow]   %s +0x%llX -> +0x%llX %s x%llu (first at %p)", key.first.c_str(), static_cast<unsigned long long>(key.second),
 				static_cast<unsigned long long>(st.realOff), st.write ? "written" : "read", st.count, reinterpret_cast<void*>(st.firstRip));
 		}
 		ReleaseSRWLockShared(&g_lock);
@@ -447,6 +501,19 @@ namespace bridge
 			}
 		}
 		out.layout = out.votes17 > out.votes16 ? 17 : (out.votes16 > out.votes17 ? 16 : 0);
+		// PlayerCharacter: singleton ID 403521 in code, and RTTI of sinks for the event sources that moved in 1.7.99.
+		const std::uint8_t pid[4] = { 0x41, 0x28, 0x06, 0x00 };  // 403521
+		for (std::size_t p = 0; p + 4 <= d.size(); ++p) {
+			if (std::memcmp(&d[p], pid, 4) == 0) {
+				out.playerRefs++;
+			}
+		}
+		const std::string text(d.begin(), d.end());
+		for (const char* ev : { "BSTEventSink@UBGSActorCellEvent@RE@@", "BSTEventSink@UBGSActorDeathEvent@RE@@", "BSTEventSink@UPositionPlayerEvent@RE@@" }) {
+			if (text.find(ev) != std::string::npos) {
+				out.playerSinks.push_back(std::string(ev).substr(16, std::strlen(ev) - 16 - 5));
+			}
+		}
 		return out;
 	}
 }
