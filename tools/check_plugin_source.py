@@ -34,6 +34,16 @@ RULES = [
     (r'\b(PlayerInputHandler|HeldStateHandler|AttackBlockHandler|LookHandler)\b',
      '2 virtual functions inserted at slot 2 in PlayerInputHandler; AttackBlockHandler/LookHandler data moved',
      'derived classes get the wrong callbacks; member access reads wrong fields'),
+    (r'\b(ActivateHandler|AutoMoveHandler|GrabRotationHandler|JumpHandler|MovementHandler|ReadyWeaponHandler|'
+     r'RunHandler|ShoutHandler|SneakHandler|SprintHandler|TogglePOVHandler|ToggleRunHandler)\b',
+     'derives from PlayerInputHandler, which gained 2 virtual functions at slot 2',
+     'write_vfunc / vtable hooks on this class with an index >= 2 replace a different function; '
+     'the bridge refuses such writes (patch_guard) and logs them'),
+    (r'(RelocationID|REL::ID|VariantID|RELOCATION_ID)\s*[\(\{][^;]*[\)\}]\s*(\.address\(\))?\s*\+\s*'
+     r'(0x[0-9A-Fa-f]+|REL::VariantOffset|VariantOffset|REL::Relocate|RELOCATION_OFFSET)',
+     'patch site = function ID + an offset read off 1.6.x machine code',
+     'if 1.7.x recompiled that function the offset lands on other code; the bridge checks every such write at '
+     'runtime ([patch] lines) and refuses ones that miss (patch_guard)'),
     (r'\bBSInputEventQueue\b',
      'queue head/tail and event buffers moved',
      'reads the wrong input events'),

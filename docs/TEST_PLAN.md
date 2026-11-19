@@ -76,3 +76,14 @@ Not covered: the MSVC build, the SEH path, a real CommonLib plugin, the real SKS
 
 1. `dry_run=1`. Check `skse64.log` shows SKSE-Bridge loaded and does **not** list the legacy DLL. Send both logs.
 2. `dry_run=0`. Tiers T0–T2 from the log, then T3/T4.
+
+
+## Patch audit / guard (0.4.0)
+
+Done (Wine, synthetic): see DESIGN Stage 8 "Harness". In game, with Improved Camera SE 1.1.2 in `Legacy\`:
+1. Load a save that crashed before. Expected `[patch] ... BLOCKED` for ID 19165+0x7B, 41996+0x2F4, 37356+0xB64
+   (if their bytes are not what the hook expects) and for the TogglePOVHandler slot 4.
+2. If the save loads: IC works except body-indoors fix, smooth animation transitions, horse look-down fix 1
+   and POV-toggle tracking. Report what else misbehaves.
+3. Negative control: `patch_guard=0` must reproduce the crash; the `[patch] ... UNSAFE` lines show which.
+4. Every other hosted plugin: `[patch] summary` should show 0 blocked for plugins that worked before.

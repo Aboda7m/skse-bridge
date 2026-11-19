@@ -12,7 +12,7 @@ namespace bridge
 {
 	namespace
 	{
-		constexpr Version kHostVersion{ { 0, 1, 0, 0 } };
+		constexpr Version kHostVersion{ { 0, 4, 0, 0 } };
 
 		struct Config
 		{
@@ -29,6 +29,8 @@ namespace bridge
 			bool                      rttiScan{ true };
 			bool                      faultLog{ true };
 			bool                      messagingFanout{ true };
+			bool                      patchAudit{ true };
+			bool                      patchGuard{ true };
 		};
 
 		struct Preflight
@@ -105,13 +107,15 @@ namespace bridge
 			c.rttiScan = ini_bool(ini, L"Diagnostics", L"rtti_scan", true);
 			c.faultLog = ini_bool(ini, L"Diagnostics", L"fault_log", true);
 			c.messagingFanout = ini_bool(ini, L"Compatibility", L"messaging_fanout", true);
+			c.patchAudit = ini_bool(ini, L"Diagnostics", L"patch_audit", true);
+			c.patchGuard = ini_bool(ini, L"Compatibility", L"patch_guard", true);
 			logf("config: dry_run=%d legacy_dir=%s plugins=%s", c.dryRun ? 1 : 0, narrow(c.legacyDir).c_str(),
 				c.plugins.empty() ? "*" : narrow(list).c_str());
 			logf("config: translate=%d legacy_runtime=%s spoof_skse_runtime=%d id_table=%d force=%d address_library=%s",
 				c.translate ? 1 : 0, c.spoof.str('.').c_str(), c.spoofSkseRuntime ? 1 : 0, c.idTable ? 1 : 0, c.force ? 1 : 0,
 				c.addressLibrary.empty() ? "(auto)" : narrow(c.addressLibrary).c_str());
-			logf("config: verify_ids=%d rtti_scan=%d fault_log=%d messaging_fanout=%d", c.verifyIds ? 1 : 0, c.rttiScan ? 1 : 0,
-				c.faultLog ? 1 : 0, c.messagingFanout ? 1 : 0);
+			logf("config: verify_ids=%d rtti_scan=%d fault_log=%d patch_audit=%d messaging_fanout=%d patch_guard=%d", c.verifyIds ? 1 : 0,
+				c.rttiScan ? 1 : 0, c.faultLog ? 1 : 0, c.patchAudit ? 1 : 0, c.messagingFanout ? 1 : 0, c.patchGuard ? 1 : 0);
 			return c;
 		}
 
@@ -307,6 +311,7 @@ namespace bridge
 			if (translate) {
 				ic.spoofVersion = true;
 				ic.spoof = c.spoof;
+				ic.patchAudit = pf.ok && c.patchAudit;
 				if (pf.ok && c.idTable) {
 					std::wstring stem = file;
 					if (const auto dot = stem.find_last_of(L'.'); dot != std::wstring::npos) {
@@ -359,6 +364,10 @@ namespace bridge
 				logf("  interposer (%s): patched slots GetFileVersionInfoW=%d VerQueryValueW=%d GetFileVersionInfoA=%d VerQueryValueA=%d OpenFileMappingW=%d CreateFileMappingW=%d",
 					early.patched ? "early, before DllMain" : "late, after DllMain", ir.getFileVersionInfoW, ir.verQueryValueW,
 					ir.getFileVersionInfoA, ir.verQueryValueA, ir.openFileMappingW, ir.createFileMappingW);
+				if (ic.patchAudit) {
+					logf("  patch audit: VirtualProtect slots=%d%s", ir.virtualProtect,
+						ir.virtualProtect ? "" : " (plugin does not import VirtualProtect by name; its game-code writes are not seen)");
+				}
 				if (!early.patched) {
 					logf("  note: %s; anything this plugin did with versions or IDs during DllMain/static init ran unpatched",
 						!early.available ? "loader notifications unavailable" : (!early.sawModule ? "no loader notification for this module" : "imports were not yet bound at the notification"));
@@ -392,6 +401,9 @@ namespace bridge
 				logf("  T1 SKSEPlugin_Load returned %s", result ? "true" : "false");
 			} else {
 				logf("  T1 SKSEPlugin_Load raised SEH exception 0x%08lX", code);
+			}
+			if (ic.patchAudit) {
+				patch_audit_flush(("after SKSEPlugin_Load of " + narrow(file)).c_str());
 			}
 		}
 	}
@@ -453,6 +465,9 @@ extern "C"
 			logf("preflight: %s%s", pf.ok ? "ok" : "FAILED: ", pf.ok ? "" : pf.why.c_str());
 			if (pf.ok) {
 				write_missing_report(pf);
+				if (c.patchAudit) {
+					patch_audit_init(pf.legacy, pf.entries, c.patchGuard);
+				}
 				if (c.verifyIds) {
 					TableStats st;
 					verify_table(build_legacy_table(pf.legacy, pf.entries, pf.baseRules, st));

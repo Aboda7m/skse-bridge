@@ -199,11 +199,24 @@ namespace bridge
 	void check_ids(const std::wstring& path, const std::vector<IdEntry>& legacy, const std::vector<IdEntry>& table);
 	[[nodiscard]] std::uintptr_t exe_base();
 	[[nodiscard]] std::uint32_t  exe_size();
+	[[nodiscard]] bool           exe_rva_exec(std::uint64_t rva);
+	[[nodiscard]] bool           exe_rva_func_start(std::uint64_t rva);  // a .pdata BeginAddress
 
 	// ---- rtti.cpp : read-only RTTI scan of a loaded legacy module ----
 	// Reports plugin classes that derive from game interfaces whose vtable changed in 1.7.99.
 	// Returns the number of affected classes.
 	int scan_rtti(HMODULE mod, const std::string& name);
+
+	struct GameVtableInfo
+	{
+		std::string cls;               // class owning the vtable, from SkyrimSE.exe RTTI
+		bool        changed{ false };  // it is, or derives from, an interface that gained slots in 1.7.99
+		std::string base;              // that interface
+		unsigned    insertAt{ 0 };
+		unsigned    added{ 0 };
+	};
+	// False if `vtable` is not preceded by a valid RTTI locator in SkyrimSE.exe.
+	bool rtti_exe_vtable(std::uintptr_t vtable, GameVtableInfo& out);
 
 	// ---- faultlog.cpp : first-chance exception attribution (log only, never handles) ----
 	void fault_log_install(const std::vector<IdEntry>& installed);
@@ -226,6 +239,7 @@ namespace bridge
 		Version spoof{};
 		HANDLE  mapping{ nullptr };  // private table, may be null
 		std::size_t mappingBytes{ 0 };
+		bool    patchAudit{ false };  // watch VirtualProtect calls on SkyrimSE.exe (patchaudit.cpp)
 	};
 
 	struct InterposeResult
@@ -236,10 +250,19 @@ namespace bridge
 		int verQueryValueA{ 0 };
 		int openFileMappingW{ 0 };
 		int createFileMappingW{ 0 };
+		int virtualProtect{ 0 };
 	};
 
 	InterposeResult install_interposer(HMODULE legacy, const std::wstring& name, const InterposeConfig& cfg);
 	bool            imports_bound(HMODULE mod);
+
+	// ---- patchaudit.cpp : what hosted plugins write into SkyrimSE.exe, and the patch guard ----
+	// legacy/current: Address Libraries sorted by ID. guard: refuse writes judged to land on the wrong code.
+	void patch_audit_init(const std::vector<IdEntry>& legacy, const std::vector<IdEntry>& current, bool guard);
+	// Called from the VirtualProtect interposer. Returns false if the call must be refused.
+	bool patch_audit_protect(const std::string& module, void* addr, std::size_t size, DWORD newProtect);
+	void patch_audit_after(void* addr, DWORD newProtect, BOOL ok);
+	void patch_audit_flush(const char* when);  // logs writes whose protection was never restored, and a summary
 
 	// ---- earlyload.cpp : patch a legacy module before its DllMain / static initializers run ----
 	struct EarlyResult

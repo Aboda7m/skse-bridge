@@ -229,3 +229,61 @@ ID 51612 = `HUDMenu::ProcessMessage`, per CNO `include/Hooks.h:48,58`). IUI disp
 **Harness**: mock SKSE that refuses unknown senders; "ConsumerMod" listens to "ProviderMod" and calls
 `GetPluginInfo`; "ProviderMod" dispatches type 5 on kDataLoaded. Previous build: refused, null, nothing
 delivered (CNO's symptoms). New build: listening, found, consumer received type 5 from ProviderMod.
+
+
+## Stage 8 — patch audit and patch guard (2026-11-19, Improved Camera SE 1.1.2)
+
+**Symptom** (user's logs, 1.7.104): ImprovedCameraSE.dll loads through the bridge (early patch, spoofed
+1.6.1170.0, private ID table, `T1 ... true`, messages 0/1/6/8/2 delivered, RTTI 0 incompatible), reaches the
+main menu, loads a save and the game crashes. No `[fault]` line, no crash-logger file in the folder.
+
+**Evidence, source** (ArranzCNL/ImprovedCameraSE-NG 2e441c1, source/skyrimse/Hooks.cpp:543-633) [Verified]:
+all hooks are installed in `SKSEPlugin_Load`. Most are `ID + offset` call-site hooks (`write_thunk_call<5/6>`),
+byte patches (`REL::safe_write`), two function-start MinHook hooks, two whole-function `asm_replace`, and two
+`write_vfunc` (BSLookAtModifier slot 23, **TogglePOVHandler slot 4**). The offsets are hand-picked per runtime
+(`REL::VariantOffset(SE, AE, VR)`); the AE value was read off 1.6.x code.
+
+**Evidence, Address Library** (1.6.1170 vs 1.7.104 files, read-only; "span" = distance to the next ID) [Verified]:
+every IC ID exists in 1.7.104. Spans are unchanged for all sites except three:
+
+| IC site | AE ID + offset | span 1.6.1170 → 1.7.104 | when it runs |
+|---|---|---|---|
+| TESObjectCell_Get3D (`write_call<6>`) | 19165 + 0x7B | 0xA30 → 0xA90 | cell 3D load (save load) |
+| SmoothAnimationTransitions (`write_call<6>`) | 41996 + 0x2F4 | 0x900 → 0x920 | actor animation update |
+| HorseLookingDownFix1 (byte patch) | 37356 + 0xB64 | 0xFA0 → 0xFB0 | mounted camera |
+
+A changed span means that function was recompiled. CommonLib-NG's `write_call<6>` assumes `FF 15 disp32`
+at the site, takes the original target from that displacement and overwrites 6 bytes. If 1.7.104 has a
+different instruction at +0x7B, the patch cuts an instruction in half and the saved "original" pointer is
+garbage; the crash then happens later, in game code, with no IC frame (matches: no `[fault]`, crash on save
+load). [Assumption] until the bytes at those sites are read: the 0.4.0 log prints them.
+
+Also found [Verified]: `TogglePOVHandler` derives from `PlayerInputHandler`, which gained 2 slots at index 2
+in 1.7.99, so IC's slot-4 hook (1.6 `ProcessButton`) now replaces `ProcessThumbstick` (wrong feature, not a
+crash: the thunk calls the saved original). IC also writes `PlayerCharacter::playerFlags` (moved +8) around
+its ShaderReferenceEffect hooks (wrong field toggled and restored). These cannot be fixed by the bridge.
+
+**Fix — universal, not IC-specific** (`src/patchaudit.cpp`, VirtualProtect slot in `src/interpose.cpp`):
+- The hosted plugin's import of `VirtualProtect` is interposed (its own IAT only). CommonLib-NG
+  `safe_write`/`safe_fill`, the trampoline and MinHook all unlock the target with VirtualProtect before
+  writing and restore after (NG `src/REL/Relocation.cpp:7-30`) [Verified].
+- Every unlock of SkyrimSE.exe memory is judged against both Address Libraries (IDs present in both):
+  function start → ok; span unchanged → ok; span changed and the 5/6-byte write sits on `E8/E9` /
+  `FF 15/FF 25` → allowed with a warning; span changed otherwise → **unsafe**. Vtable writes are located
+  from the exe's own RTTI; a slot at/after an inserted index (rtti.cpp table) → **unsafe**.
+- `patch_guard=1` (default) makes the unlock of an unsafe write fail. NG's `safe_write` then skips the copy
+  (the assert is a no-op in release) [Verified in source]; the feature is missing, game code stays intact.
+  MinHook reports `MH_ERROR_MEMORY_PROTECT`. Other libraries may react differently [Unknown].
+- `[patch]` lines: plugin, `SkyrimSE.exe+RVA (ID n+0xD)`, bytes before → after, verdict. Summary after each
+  `SKSEPlugin_Load` and after kDataLoaded.
+
+**Limits**: equal span is evidence, not proof, of unchanged code; a changed function that keeps the same
+size passes. Plugins that write through other APIs (WriteProcessMemory, direct writes after their own
+VirtualProtect on a larger region, `GetProcAddress("VirtualProtect")`) are seen only partly or not at all.
+Blocking removes features; it does not make the plugin correct. Rebuilding for 1.7 remains the real fix.
+
+**Harness** (Wine, synthetic exe with RTTI for `TogglePOVHandler : PlayerInputHandler`, synthetic ALs):
+5-byte call over E8 in unchanged function → ok; over E8 in changed function → warned; over `48 89 C8` in
+changed function → BLOCKED; 14-byte write at function start → ok; 2-byte payload in changed function →
+BLOCKED; vtable slot 1 → ok; vtable slot 4 → BLOCKED ("meant the function that is now slot 6"). Old
+harness (OldPlugin) unchanged. Builds; needs in-game verification.

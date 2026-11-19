@@ -130,3 +130,20 @@ Source: `Address Library/` (Address Library All in One 1.7.104.0 v13), read in p
 - In-game log (1.7.104, SKSE 2.3.1): PickPocketRedone-NG and RTL-SUPPORT-NG both reached `T1 SKSEPlugin_Load returned true`; 392,538 / 428,461 legacy IDs translated. Version spoof and private table worked as designed. [V, from your log]
 - One plugin reportedly stops working later. Cause not determined; no assumption made. Stage 4 adds the instruments to find it: offset verification, RTTI vtable scan, fault log, source checker. See `docs/DESIGN.md` "Stage 4".
 - Four renumbered functions (NG `AE_CHECK`) are now translated instead of poisoned.
+
+
+## Addendum 4 — Improved Camera SE 1.1.2 crash on 1.7.104 (2026-11-19)
+
+Inputs: `example-sources/Improved Camera SE-93962-1-1-2-1757468263` (user's logs + DLL), upstream source
+ArranzCNL/ImprovedCameraSE-NG 2e441c1, Address Library 1.6.1170 and 1.7.104. Not available: crash-logger
+output, SkyrimSE.exe 1.7.104 (access to the game folder was declined by the tool; not retried).
+
+- [Verified] Bridge did its part: early patch, spoof, private table, T1 true, messages delivered.
+- [Verified] All 34 Address Library IDs IC uses (26 functions, 8 settings/globals) exist in 1.7.104.
+- [Verified] 3 IC in-function patch sites lie in functions whose ID span changed (table in DESIGN Stage 8).
+- [Verified] TogglePOVHandler slot-4 hook hits the shifted PlayerInputHandler vtable; PlayerCharacter flag
+  writes use the pre-1.7.99 offset.
+- [Assumption] The crash is the TESObjectCell_Get3D `write_call<6>` (or SmoothAnimationTransitions) landing on
+  a non-call instruction. Confirmation: with 0.4.0, the `[patch]` line for ID 19165+0x7B shows the bytes.
+- [Verified] IC declares `HasNoStructUse(true)` while using PlayerCharacter runtime data: a plugin's
+  self-declared independence flags are not reliable evidence.

@@ -240,6 +240,24 @@ namespace bridge
 			return ::CreateFileMappingW(file, sa, protect, hi, lo, name);
 		}
 
+		// Patch audit (patchaudit.cpp): sees every VirtualProtect the hosted plugin makes on SkyrimSE.exe and may refuse
+		// one that would write over the wrong game code. Calls on any other memory pass straight through.
+		BOOL WINAPI Hook_VirtualProtect(LPVOID addr, SIZE_T size, DWORD protect, PDWORD old)
+		{
+			const void* const caller = BRIDGE_RETURN_ADDRESS();
+			ModuleCtx         ctx;
+			if (!(find_ctx(caller, ctx) && ctx.cfg.patchAudit)) {
+				return ::VirtualProtect(addr, size, protect, old);
+			}
+			if (!patch_audit_protect(ctx.name, addr, size, protect)) {
+				SetLastError(ERROR_ACCESS_DENIED);
+				return FALSE;
+			}
+			const BOOL ok = ::VirtualProtect(addr, size, protect, old);
+			patch_audit_after(addr, protect, ok);
+			return ok;
+		}
+
 		// Replace every import-table slot of `mod` that imports `fn` by name. Returns slots patched.
 		int patch_iat(HMODULE mod, const char* fn, void* hook)
 		{
@@ -334,6 +352,9 @@ namespace bridge
 		}
 		r.openFileMappingW = patch_iat(legacy, "OpenFileMappingW", reinterpret_cast<void*>(&Hook_OpenFileMappingW));
 		r.createFileMappingW = patch_iat(legacy, "CreateFileMappingW", reinterpret_cast<void*>(&Hook_CreateFileMappingW));
+		if (cfg.patchAudit) {
+			r.virtualProtect = patch_iat(legacy, "VirtualProtect", reinterpret_cast<void*>(&Hook_VirtualProtect));
+		}
 		FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
 		return r;
 	}

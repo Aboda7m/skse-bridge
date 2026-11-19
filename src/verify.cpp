@@ -103,6 +103,12 @@ namespace bridge
 
 	std::uintptr_t exe_base() { return info().base; }
 	std::uint32_t  exe_size() { return info().size; }
+	bool           exe_rva_exec(std::uint64_t rva)
+	{
+		const Section* s = section_of(rva);
+		return s && s->exec;
+	}
+	bool exe_rva_func_start(std::uint64_t rva) { return is_func_start(rva); }
 
 	void verify_table(const std::vector<IdEntry>& table)
 	{

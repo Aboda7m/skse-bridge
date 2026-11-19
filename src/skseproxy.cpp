@@ -216,6 +216,9 @@ namespace bridge
 				}
 				cb(msg);  // no exception filter: a crash here must stay a crash (the fault log records it)
 			}
+			if (from == "skse" && msg->type == 8) {  // kDataLoaded: most plugins have installed their hooks by now
+				patch_audit_flush("after kDataLoaded");
+			}
 		}
 
 		bool proxy_register(std::uint32_t, const char* sender, void* handler)

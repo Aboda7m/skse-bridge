@@ -138,6 +138,52 @@ namespace bridge
 		}
 	}
 
+	// RTTI of a vtable inside SkyrimSE.exe: class name, and whether that class (or a base) gained slots in 1.7.99.
+	bool rtti_exe_vtable(std::uintptr_t vtable, GameVtableInfo& out)
+	{
+		Image img;
+		img.base = exe_base();
+		img.size = exe_size();
+		if (vtable < img.base + 8 || vtable - img.base >= img.size) {
+			return false;
+		}
+		const std::uint64_t colPtr = *reinterpret_cast<const std::uint64_t*>(vtable - 8);
+		if (colPtr < img.base || colPtr - img.base >= img.size) {
+			return false;
+		}
+		const std::uint64_t colRva = colPtr - img.base;
+		const COL*          col = img.at<COL>(colRva);
+		if (!col || col->signature != 1 || static_cast<std::uint64_t>(col->self) != colRva) {
+			return false;
+		}
+		const std::string cls = strip(img.name_at(static_cast<std::uint32_t>(col->typeDescriptor) + 16));
+		out.cls = pretty(cls);
+		std::vector<std::string> names{ cls };
+		if (const CHD* chd = img.at<CHD>(static_cast<std::uint32_t>(col->classDescriptor)); chd && chd->numBaseClasses <= 256) {
+			for (std::uint32_t b = 1; b < chd->numBaseClasses; ++b) {
+				const auto* entry = img.at<std::int32_t>(static_cast<std::uint32_t>(chd->baseClassArray) + 4ull * b);
+				const BCD*  bcd = entry ? img.at<BCD>(static_cast<std::uint32_t>(*entry)) : nullptr;
+				if (bcd) {
+					names.push_back(strip(img.name_at(static_cast<std::uint32_t>(bcd->typeDescriptor) + 16)));
+				}
+			}
+		}
+		// The exe's RTTI names are the game's own (no RE:: namespace): match on the class name part.
+		for (const auto& ch : kChanges) {
+			const std::string key(ch.key, std::strlen(ch.key) - std::strlen("@RE@@"));
+			for (const auto& n : names) {
+				if (n == key + "@@" || n == ch.key) {
+					out.changed = true;
+					out.base = ch.cls;
+					out.insertAt = ch.insertAt;
+					out.added = ch.added;
+					return true;
+				}
+			}
+		}
+		return true;
+	}
+
 	int scan_rtti(HMODULE mod, const std::string& modName)
 	{
 		Image img;

@@ -75,13 +75,25 @@ own code.
   interfaces). Plugins whose code depends on them need to be rebuilt. The bridge can detect some of these
   cases and logs them, but cannot fix them.
 - **Changed functions.** An ID that still exists may point at a function whose signature or behaviour
-  changed, and hooks placed at `ID + offset` may land in the wrong place.
+  changed. Hooks placed at `ID + offset` (an offset inside the function, read off 1.6.1170 machine code)
+  land on other code when 1.7.x compiled that function differently. Since 0.4.0 the bridge checks every
+  such write and refuses the ones that miss (`patch_guard`): the plugin then loads without that feature
+  instead of crashing the game later. The plugin still needs a rebuild for full function.
 - **Shared SKSE identity.** Hosted plugins share the bridge's SKSE plugin handle. Messaging is handled by the
   bridge (hosted plugins can message each other, for example CompassNavigationOverhaul and InfinityUI), but
   plugins loaded by SKSE itself cannot reach a hosted plugin by name. The co-save is shared too, so host
   only one plugin that stores its own co-save data. The log warns if a second one tries.
 - **Supported lineage.** Only plugins built with the CommonLibSSE-NG lineage are understood. Others are
   skipped unless `force=1` is set.
+
+## What's new in 0.4.0
+
+- Patch audit: every write a hosted plugin makes into `SkyrimSE.exe` (hooks, byte patches, vtable hooks) is
+  logged as a `[patch]` line with the Address Library ID, the bytes before and after, and a verdict.
+- Patch guard: writes that would land on the wrong game code are refused and logged, so a plugin with
+  outdated in-function hook offsets loses those features instead of crashing the game later
+  (found investigating Improved Camera SE 1.1.2 on 1.7.104).
+- `tools/check_plugin_source.py` also flags `ID + offset` patch sites and vtable hooks on input handlers.
 
 ## What's new in 0.3.0
 
@@ -103,6 +115,8 @@ own code.
 | `[Translate] enabled` | `0` = plain load with nothing adapted (negative control) |
 | `[Translate] force` | `1` = load plugins even when prerequisites are missing |
 | `[Diagnostics] verify_ids`, `rtti_scan`, `fault_log` | Extra checks written to the log |
+| `[Diagnostics] patch_audit` | Log every write hosted plugins make into the game exe (`[patch]` lines) |
+| `[Compatibility] patch_guard` | `1` = refuse writes that would land on the wrong game code (default); `0` = log only |
 
 Optional per-plugin files in `Legacy\compat\`: `<plugin>.ids` (ID overrides, one `legacyID = newID` per
 line) and `<plugin>.check` (paste the IDs your plugin uses and the log reports each one).
@@ -120,6 +134,9 @@ Check it first to confirm SKSE loaded SKSE-Bridge and to look for errors. Useful
 - `T1 SKSEPlugin_Load returned true`: the hosted plugin started.
 - `RTTI: INCOMPATIBLE VTABLE`: the plugin implements a game interface whose layout changed.
 - `[fault]`: an exception in or through a hosted plugin, with locations. Start here when a plugin stops working.
+- `[patch] ... BLOCKED`: a hook or byte patch the plugin tried to place on game code that changed in 1.7.x.
+  The bridge refused it; the feature behind it will not work, but the game stays intact.
+- `[patch] summary`: per plugin, how many writes were fine, warned, or blocked.
 
 When reporting a problem, please include:
 
