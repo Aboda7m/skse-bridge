@@ -2,7 +2,7 @@
 set_xmakever('2.8.2')
 
 set_project('SKSE-Bridge')
-set_version('0.7.1')
+set_version('0.7.3')
 set_languages('c++20')
 set_warnings('allextra')
 set_encodings('utf-8')

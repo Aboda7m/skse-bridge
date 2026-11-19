@@ -95,6 +95,13 @@ own code.
 - **Newer plugins on an older game.** A plugin built for 1.7 on a 1.6 game, or for 1.6.1170 on 1.6.640, has the
   newer structure layouts compiled in. ID translation and the log help; the layouts still need a rebuild.
 
+## What's new in 0.7.3 (experimental)
+
+- One Yes/No question per plugin for all fixes it needs, saved once in `Data\SKSE\Plugins\SKSE-Bridge\ShadowVM\<dll>.json`
+  and not asked again (no more re-asking after an interrupted launch).
+- The reported game version (formerly `[PresentVersion]` in the ini) is detected from the plugin's own list of supported
+  versions and is part of that question; stored as `"present_version"` in the JSON. Old ini lines are migrated.
+
 ## What's new in 0.7.2 (experimental)
 
 - Shadow PlayerCharacter: fixes plugins built for 1.7 that hang while registering player event sinks on 1.6

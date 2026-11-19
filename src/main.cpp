@@ -14,7 +14,7 @@ namespace bridge
 {
 	namespace
 	{
-		constexpr Version kHostVersion{ { 0, 7, 2, 0 } };
+		constexpr Version kHostVersion{ { 0, 7, 3, 0 } };
 
 		struct Config
 		{
@@ -254,7 +254,6 @@ namespace bridge
 		// ---- shadow VM decisions: Data\SKSE\Plugins\SKSE-Bridge\ShadowVM\<dll>.json, one file per plugin ----
 		// Easy to find, edit or delete with the mod (under MO2 they land in Overwrite). Deleting a file = ask again.
 		// The file records the DLL's SHA-256 prefix: an updated DLL is asked about again.
-		// _session_open.txt exists while a session with a shadowed plugin has not reached a loaded game.
 		SRWLOCK g_decLock = SRWLOCK_INIT;
 
 		std::wstring shadow_dir()
@@ -301,93 +300,143 @@ namespace bridge
 			return r;
 		}
 
-		// Saved answer for this DLL build: 1 yes, 0 no, -1 none. key: "shadow_vm" or "shadow_player".
-		int read_decision(const std::wstring& file, const std::string& sha, const char* key)
+		// ---- per-plugin choices: one JSON per plugin, one Yes/No question per plugin, asked once ----
+		// Keys: "shadow_vm", "shadow_player" (true/false), "present_version" ("1.7.104.0" or false). A key missing for a
+		// fix the plugin needs means "not decided yet". Answers are tied to the DLL's SHA-256 (an updated DLL is asked again).
+		struct Choices
 		{
+			int     vm{ -1 };       // -1 undecided, 0 off, 1 on
+			int     player{ -1 };
+			int     present{ -1 };  // -1 undecided, 0 off, 1 on (presentVer)
+			Version presentVer{};
+		};
+
+		std::wstring choices_path(const std::wstring& file) { return shadow_dir() + file + L".json"; }
+
+		Choices read_choices(const std::wstring& file, const std::string& sha)
+		{
+			Choices                   ch;
 			std::vector<std::uint8_t> raw;
 			std::string               err;
-			if (!read_file(shadow_dir() + file + L".json", raw, err)) {
-				return -1;
+			if (!read_file(choices_path(file), raw, err)) {
+				return ch;
 			}
 			const std::string t(raw.begin(), raw.end());
 			const std::string saved = json_value(t, "sha256");
 			if (!saved.empty() && !sha.empty() && saved.substr(0, 16) != sha.substr(0, 16)) {
-				logf("  shadow: saved answers are for another build of %s (sha256 %s...); asking again", narrow(file).c_str(), saved.substr(0, 16).c_str());
-				return -1;
+				logf("  choices: saved answers are for another build of %s (sha256 %s...); asking again", narrow(file).c_str(), saved.substr(0, 16).c_str());
+				return ch;
 			}
-			const std::string v = json_value(t, key);
-			return v == "true" ? 1 : (v == "false" ? 0 : -1);
+			auto flag = [&](const char* key) {
+				const std::string v = json_value(t, key);
+				return v == "true" ? 1 : (v == "false" ? 0 : -1);
+			};
+			ch.vm = flag("shadow_vm");
+			ch.player = flag("shadow_player");
+			const std::string pv = json_value(t, "present_version");
+			if (pv == "false" || pv == "off" || pv == "no") {
+				ch.present = 0;
+			} else if (!pv.empty() && Version::parse(widen(pv), ch.presentVer)) {
+				ch.present = 1;
+			}
+			return ch;
 		}
 
-		void write_decision(const std::wstring& file, const std::string& sha, const char* key, bool on)
+		void write_choices(const std::wstring& file, const std::string& sha, const Choices& ch)
 		{
-			int vm = read_decision(file, sha, "shadow_vm");
-			int pl = read_decision(file, sha, "shadow_player");
-			(std::string(key) == "shadow_vm" ? vm : pl) = on ? 1 : 0;
 			std::string text = "{\r\n  \"plugin\": \"" + narrow(file) + "\",\r\n  \"sha256\": \"" + sha + "\",\r\n";
-			if (vm >= 0) {
-				text += std::string("  \"shadow_vm\": ") + (vm ? "true" : "false") + ",\r\n";
+			if (ch.vm >= 0) {
+				text += std::string("  \"shadow_vm\": ") + (ch.vm ? "true" : "false") + ",\r\n";
 			}
-			if (pl >= 0) {
-				text += std::string("  \"shadow_player\": ") + (pl ? "true" : "false") + ",\r\n";
+			if (ch.player >= 0) {
+				text += std::string("  \"shadow_player\": ") + (ch.player ? "true" : "false") + ",\r\n";
 			}
-			text += "  \"note\": \"Written by SKSE-Bridge. shadow_vm / shadow_player: true = run this plugin with that shadow, false = load it normally. Delete this file to be asked again.\"\r\n}\r\n";
-			write_text(shadow_dir() + file + L".json", text);
+			if (ch.present == 1) {
+				text += "  \"present_version\": \"" + ch.presentVer.str('.') + "\",\r\n";
+			} else if (ch.present == 0) {
+				text += "  \"present_version\": false,\r\n";
+			}
+			text +=
+				"  \"note\": \"Written by SKSE-Bridge. shadow_vm / shadow_player: true = run with that shadow. present_version: the game version "
+				"reported to this plugin, or false. Edit a value to change it; delete this file to be asked again.\"\r\n}\r\n";
+			if (!write_text(choices_path(file), text)) {
+				logf("  choices: could not write %s (error %lu)", narrow(choices_path(file)).c_str(), GetLastError());
+			}
 		}
 
-		std::wstring session_marker() { return shadow_dir() + L"_session_open.txt"; }
-		bool         g_anyShadow = false;  // a plugin runs with a shadow this session
-
-		// Shadow decision for one plugin and class: ini override, then the saved answer, then a question.
-		bool decide_shadow(const Config& c, ShadowClass cls, const std::wstring& file, const PeReport& rep, bool plugin17, bool game17, bool lastCrashed,
-			const std::string& why)
+		// Old per-plugin ini lines ([VMShadow] / [PlayerShadow] / [PresentVersion] <dll>=...) are taken over into the JSON once.
+		void migrate_ini_choices(const Config& c, const std::wstring& file, Choices& ch, bool& changed)
 		{
-			const bool        vm = cls == kShadowSkyrimVM;
-			const wchar_t*    section = vm ? L"VMShadow" : L"PlayerShadow";
-			const char*       key = vm ? "shadow_vm" : "shadow_player";
-			const char*       tag = vm ? "vm-shadow" : "player-shadow";
-			const std::wstring over = ini_string(c.ini, section, file.c_str(), L"");
-			if (!over.empty()) {
-				const bool on = over == L"1" || iequals(over, L"true") || iequals(over, L"yes");
-				logf("  %s: %s by [%s] %s", tag, on ? "ON" : "off", narrow(section).c_str(), narrow(file).c_str());
-				return on;
+			auto yes = [](const std::wstring& v) { return v == L"1" || iequals(v, L"true") || iequals(v, L"yes"); };
+			if (const std::wstring v = ini_string(c.ini, L"VMShadow", file.c_str(), L""); !v.empty() && ch.vm < 0) {
+				ch.vm = yes(v) ? 1 : 0;
+				changed = true;
+				logf("  choices: took [VMShadow] %s=%s from the ini into the JSON (the ini line can be removed)", narrow(file).c_str(), narrow(v).c_str());
 			}
-			const int saved = read_decision(file, rep.sha256, key);
-			if (saved >= 0 && !(lastCrashed && saved == 1)) {
-				logf("  %s: %s (saved answer in %s%s.json)", tag, saved ? "ON" : "off", narrow(shadow_dir()).c_str(), narrow(file).c_str());
-				return saved == 1;
+			if (const std::wstring v = ini_string(c.ini, L"PlayerShadow", file.c_str(), L""); !v.empty() && ch.player < 0) {
+				ch.player = yes(v) ? 1 : 0;
+				changed = true;
+				logf("  choices: took [PlayerShadow] %s=%s from the ini into the JSON (the ini line can be removed)", narrow(file).c_str(), narrow(v).c_str());
 			}
-			if (saved == 1) {
-				logf("  %s: saved answer is Yes, but the last launch with a shadow did not reach the main menu (%s exists): asking again", tag,
-					narrow(session_marker()).c_str());
-			} else {
-				logf("  %s: no usable saved answer at %s%s.json", tag, narrow(shadow_dir()).c_str(), narrow(file).c_str());
+			if (const std::wstring v = ini_string(c.ini, L"PresentVersion", file.c_str(), L""); !v.empty() && ch.present < 0) {
+				Version pv{};
+				if (Version::parse(v, pv)) {
+					ch.present = 1;
+					ch.presentVer = pv;
+				} else {
+					ch.present = 0;
+				}
+				changed = true;
+				logf("  choices: took [PresentVersion] %s=%s from the ini into the JSON (the ini line can be removed)", narrow(file).c_str(), narrow(v).c_str());
 			}
-			if (!c.vmAsk) {
-				logf("  %s: off (undecided and ask_on_startup=0)", tag);
+		}
+
+		// Runtime versions a plugin lists as supported: REL::Version constants (4 x u16) of known runtimes stored next to each
+		// other in the DLL, e.g. a std::array{ RUNTIME_SSE_1_7_104, RUNTIME_SSE_1_7_99 } used by its own version check.
+		bool known_runtime(const Version& v)
+		{
+			if (v.v[0] != 1 || v.v[3] > 1) {
 				return false;
 			}
-			std::wstring text = file + (vm ? L" uses Skyrim's Papyrus VM object (SkyrimVM)" : L" uses the player object (PlayerCharacter: " + widen(why) + L")") +
-			                    L", which changed in 1.7. This DLL was built for the " + std::wstring(plugin17 ? L"1.7" : L"1.6") + L" layout and the game is " +
-			                    (game17 ? L"1.7" : L"1.6") + (vm ? L". Without help, its Papyrus functions can fail or crash.\n\n" :
-			                                                       L". Without help, registering for those events writes into the wrong place (hang or crash).\n\n");
-			if (lastCrashed) {
-				text += L"Note: the last launch with a shadow did not reach the main menu.\n\n";
+			if (v.v[1] == 5) {
+				return v.v[2] == 97 && v.v[3] == 0;
 			}
-			text += std::wstring(L"Run it with a shadow ") + (vm ? L"VM" : L"player") +
-			        L" (EXPERIMENTAL)?\n\nYes = use the shadow\nNo = load it normally\nCancel = do not load this plugin this session (asked again next launch)\n\n"
-			        L"Your choice is saved in Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\" + file + L".json (delete it to be asked again).";
-			const int r = MessageBoxW(nullptr, text.c_str(), L"SKSE-Bridge", MB_YESNOCANCEL | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND);
-			if (r == IDCANCEL) {
-				logf("  %s: user chose Cancel: plugin not loaded this session", tag);
-				throw std::runtime_error("cancelled");
+			if (v.v[1] == 6) {
+				static constexpr std::uint16_t b[] = { 317, 318, 323, 342, 353, 629, 640, 659, 1130, 1170, 1179 };
+				return std::find(std::begin(b), std::end(b), v.v[2]) != std::end(b);
 			}
-			const bool on = r == IDYES;
-			AcquireSRWLockExclusive(&g_decLock);
-			write_decision(file, rep.sha256, key, on);
-			ReleaseSRWLockExclusive(&g_decLock);
-			logf("  %s: %s (asked; saved to %s%s.json)", tag, on ? "ON" : "off", narrow(shadow_dir()).c_str(), narrow(file).c_str());
-			return on;
+			return v.v[1] == 7 && v.v[2] >= 99 && v.v[2] < 2000;
+		}
+
+		std::vector<Version> supported_list(const std::wstring& path)
+		{
+			std::vector<std::uint8_t> b;
+			std::string               err;
+			std::vector<Version>      best;
+			if (!read_file(path, b, err)) {
+				return best;
+			}
+			auto at = [&](std::size_t i) {
+				Version v{};
+				std::memcpy(v.v, b.data() + i, 8);
+				return v;
+			};
+			for (std::size_t i = 0; i + 8 <= b.size(); i += 2) {
+				if (!known_runtime(at(i))) {
+					continue;
+				}
+				std::vector<Version> run;
+				std::size_t          j = i;
+				while (j + 8 <= b.size() && known_runtime(at(j))) {
+					run.push_back(at(j));
+					j += 8;
+				}
+				if (run.size() > best.size()) {
+					best = run;
+				}
+				i = j - 2;
+			}
+			return best;
 		}
 
 		HANDLE mapping_from_bytes(const void* data, std::size_t bytes)
@@ -550,22 +599,127 @@ namespace bridge
 			if (!c.translate || !pf.ok) {
 				plan.translate = false;
 			}
-			// [PresentVersion] <dll>=<version>: the runtime version the SKSE interface reports to this plugin only, for plugins
-			// whose own code refuses unknown versions (e.g. a list of 1.7 versions) but that load the Address Library of the
-			// running game themselves. Nothing else is spoofed; the plugin's compiled structure layouts are unchanged.
-			Version presentVersion{};
-			bool    hasPresent = false;
-			if (const std::wstring pv = ini_string(c.ini, L"PresentVersion", file.c_str(), L""); !pv.empty()) {
-				if (Version::parse(pv, presentVersion)) {
-					hasPresent = true;
-					if (!plan.translate) {
-						plan.target = presentVersion;  // diagnostics (vtable direction, VM layout default) follow the claimed build
+			// Per-plugin fixes, decided once and saved in Data\SKSE\Plugins\SKSE-Bridge\ShadowVM\<dll>.json:
+			//   present_version: the runtime version the SKSE interface reports to this plugin only, for plugins whose own
+			//     code refuses the running game (a list of supported versions) but that load the running game's Address
+			//     Library themselves. Nothing else is spoofed; the plugin keeps its own structure layouts.
+			//   shadow_vm / shadow_player: shadow objects for SkyrimVM / PlayerCharacter (vmshadow.cpp).
+			Choices ch = read_choices(file, rep.sha256);
+			bool    choicesChanged = false;
+			migrate_ini_choices(c, file, ch, choicesChanged);
+
+			// Present-version candidate: the plugin carries a list of supported runtimes that excludes this game.
+			Version presentCand{};
+			bool    wantPresent = false;
+			if (pf.ok && !plan.translate) {
+				const auto list = supported_list(path);
+				if (!list.empty()) {
+					std::string names;
+					bool        hasGame = false;
+					for (const auto& v : list) {
+						names += (names.empty() ? "" : ", ") + v.str('.');
+						hasGame |= v == pf.real;
+						if (presentCand.less(v)) {
+							presentCand = v;
+						}
 					}
-					logf("  [PresentVersion] SKSE interface will report %s to this plugin (EXPERIMENTAL; its structure layouts are those of its own build)",
-						presentVersion.str('.').c_str());
-				} else {
-					logf("  [PresentVersion] %s: \"%s\" is not a version; ignored", narrow(file).c_str(), narrow(pv).c_str());
+					logf("  supported runtimes listed in the DLL: %s%s", names.c_str(), hasGame ? " (includes this game)" : " (this game is not among them)");
+					wantPresent = !hasGame;
 				}
+			}
+			if (ch.present == 1) {
+				wantPresent = true;  // a saved or migrated choice also applies when nothing was detected
+			}
+
+			// Shadow evidence. The layout the plugin was built for: code evidence, else the version it is presented, else its target.
+			const bool game17 = pf.ok && pf.real.at_least(1, 7, 99);
+			Version    built = plan.target;
+			if (ch.present == 1) {
+				built = ch.presentVer;
+			} else if (wantPresent && ch.present < 0) {
+				built = presentCand;
+			}
+			bool       plugin17 = built.at_least(1, 7, 99);
+			bool       wantVm = false, wantPlayer = false;
+			std::string sinks;
+			if (pf.ok && c.vmShadow) {
+				const VmScan vs = scan_vm_layout(path);
+				if (vs.layout) {
+					plugin17 = vs.layout == 17;
+				}
+				if (vs.idRefs) {
+					std::string sites;
+					for (std::size_t i = 0; i < vs.sites.size() && i < 8; ++i) {
+						char bf[24];
+						std::snprintf(bf, sizeof(bf), " +0x%X", vs.sites[i]);
+						sites += bf;
+					}
+					logf("  SkyrimVM: %u reference(s) to the singleton ID; reads at +0x200: %u, +0x210: %u ->%s layout %s (%s)%s", vs.idRefs, vs.votes16,
+						vs.votes17, vs.layout ? "" : " assumed", plugin17 ? "1.7" : "1.6", vs.layout ? "code evidence" : "from the version it was built for", sites.c_str());
+				}
+				for (const auto& e : vs.playerSinks) {
+					sinks += (sinks.empty() ? "" : ", ") + e;
+				}
+				if (vs.playerRefs && !vs.playerSinks.empty()) {
+					logf("  PlayerCharacter: %u reference(s) to the singleton ID; sinks for player event sources that moved in 1.7.99: %s (layout %s)",
+						vs.playerRefs, sinks.c_str(), plugin17 ? "1.7" : "1.6");
+				}
+				wantVm = vs.idRefs && plugin17 != game17;
+				wantPlayer = vs.playerRefs && !vs.playerSinks.empty() && plugin17 != game17;
+				if (vs.idRefs && !wantVm) {
+					logf("  SkyrimVM: same layout as the game; no shadow needed");
+				}
+			}
+
+			// One question per plugin, only for what is still undecided; the answer is saved for every listed fix.
+			const bool undecided = (wantPresent && ch.present < 0) || (wantVm && ch.vm < 0) || (wantPlayer && ch.player < 0);
+			if (undecided && c.vmAsk) {
+				std::wstring text = file + L" was built for Skyrim " + (plugin17 ? L"1.7" : L"1.6") + L" and the game is " + pf.real.wstr(L'.') +
+				                    L". SKSE-Bridge can run it with these EXPERIMENTAL fixes:\n\n";
+				if (wantPresent && ch.present < 0) {
+					text += L"- report game version " + presentCand.wstr(L'.') + L" to it (its own version check refuses this game)\n";
+				}
+				if (wantVm && ch.vm < 0) {
+					text += L"- shadow Papyrus VM (SkyrimVM changed in 1.7; without it its Papyrus functions can fail or crash)\n";
+				}
+				if (wantPlayer && ch.player < 0) {
+					text += L"- shadow player (PlayerCharacter changed in 1.7; without it registering " + widen(sinks) + L" can hang or crash)\n";
+				}
+				text += L"\nYes = use these fixes\nNo = load it without them\n\nAsked once. Saved in Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\" + file +
+				        L".json (edit or delete it to change).";
+				const bool on = MessageBoxW(nullptr, text.c_str(), L"SKSE-Bridge", MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES;
+				logf("  choices: asked once; answer %s", on ? "Yes" : "No");
+				if (wantPresent && ch.present < 0) {
+					ch.present = on ? 1 : 0;
+					ch.presentVer = presentCand;
+				}
+				if (wantVm && ch.vm < 0) {
+					ch.vm = on;
+				}
+				if (wantPlayer && ch.player < 0) {
+					ch.player = on;
+				}
+				choicesChanged = true;
+			} else if (undecided) {
+				logf("  choices: undecided fixes stay off (ask_on_startup=0)");
+			}
+			if (choicesChanged) {
+				AcquireSRWLockExclusive(&g_decLock);
+				write_choices(file, rep.sha256, ch);
+				ReleaseSRWLockExclusive(&g_decLock);
+				logf("  choices: saved to %s", narrow(choices_path(file)).c_str());
+			}
+
+			const bool hasPresent = ch.present == 1;
+			const Version presentVersion = ch.presentVer;
+			if (hasPresent) {
+				if (!plan.translate) {
+					plan.target = presentVersion;  // diagnostics (vtable direction) follow the claimed build
+				}
+				logf("  present-version: SKSE interface will report %s to this plugin (EXPERIMENTAL; its structure layouts are those of its own build)",
+					presentVersion.str('.').c_str());
+			} else if (wantPresent) {
+				logf("  present-version: off (%s)", ch.present == 0 ? "saved answer" : "undecided");
 			}
 			const int direction = vtable_direction(plan.target, pf.ok ? pf.real : plan.target);
 			logf("  target: built for %s, game %s -> %s (%s)", plan.target.str('.').c_str(), pf.real.str('.').c_str(),
@@ -592,56 +746,17 @@ namespace bridge
 				return;
 			}
 
-			// Shadow objects (vmshadow.cpp): static evidence, then one decision per class.
 			unsigned shadowMask = 0;
-			bool     plugin17 = plan.target.at_least(1, 7, 99);
-			if (pf.ok && c.vmShadow) {
-				const VmScan vs = scan_vm_layout(path);
-				if (vs.layout) {
-					plugin17 = vs.layout == 17;
+			if (wantVm) {
+				logf("  vm-shadow: %s", ch.vm == 1 ? "ON" : "off");
+				if (ch.vm == 1 && shadow_init(kShadowSkyrimVM, pf.real, pf.entries)) {
+					shadowMask |= 1u << kShadowSkyrimVM;
 				}
-				const bool game17 = pf.real.at_least(1, 7, 99);
-				if (vs.idRefs) {
-					std::string sites;
-					for (std::size_t i = 0; i < vs.sites.size() && i < 8; ++i) {
-						char b[24];
-						std::snprintf(b, sizeof(b), " +0x%X", vs.sites[i]);
-						sites += b;
-					}
-					logf("  SkyrimVM: %u reference(s) to the singleton ID; reads at +0x200: %u, +0x210: %u ->%s layout %s (%s)%s", vs.idRefs, vs.votes16,
-						vs.votes17, vs.layout ? "" : " assumed", plugin17 ? "1.7" : "1.6", vs.layout ? "code evidence" : "from target version", sites.c_str());
-				}
-				std::string sinks;
-				for (const auto& e : vs.playerSinks) {
-					sinks += (sinks.empty() ? "" : ", ") + e;
-				}
-				if (vs.playerRefs && !vs.playerSinks.empty()) {
-					logf("  PlayerCharacter: %u reference(s) to the singleton ID; sinks for player event sources that moved in 1.7.99: %s (layout %s)",
-						vs.playerRefs, sinks.c_str(), plugin17 ? "1.7" : "1.6");
-				}
-				const bool wantVm = vs.idRefs && plugin17 != game17;
-				const bool wantPlayer = vs.playerRefs && !vs.playerSinks.empty() && plugin17 != game17;
-				if (vs.idRefs && !wantVm) {
-					logf("  SkyrimVM: same layout as the game; no shadow needed");
-				}
-				if (wantVm || wantPlayer) {
-					const bool lastCrashed = file_exists(session_marker());
-					try {
-						if (wantVm && decide_shadow(c, kShadowSkyrimVM, file, rep, plugin17, game17, lastCrashed, {}) &&
-							shadow_init(kShadowSkyrimVM, pf.real, pf.entries)) {
-							shadowMask |= 1u << kShadowSkyrimVM;
-						}
-						if (wantPlayer && decide_shadow(c, kShadowPlayer, file, rep, plugin17, game17, lastCrashed, "event sinks " + sinks) &&
-							shadow_init(kShadowPlayer, pf.real, pf.entries)) {
-							shadowMask |= 1u << kShadowPlayer;
-						}
-					} catch (const std::exception&) {
-						return;
-					}
-					if (shadowMask) {
-						write_text(session_marker(), "A launch with a shadowed plugin has not reached the main menu (kDataLoaded) yet.\r\n");
-						g_anyShadow = true;
-					}
+			}
+			if (wantPlayer) {
+				logf("  player-shadow: %s", ch.player == 1 ? "ON" : "off");
+				if (ch.player == 1 && shadow_init(kShadowPlayer, pf.real, pf.entries)) {
+					shadowMask |= 1u << kShadowPlayer;
 				}
 			}
 			bool shadowVm = shadowMask != 0;
@@ -826,7 +941,8 @@ namespace bridge
 {
 	void vm_session_reached_game()
 	{
-		const std::wstring m = session_marker();
+		// Since 0.7.3 answers are final; a marker left by 0.7.0-0.7.2 is only removed.
+		const std::wstring m = game_dir() + L"Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\_session_open.txt";
 		if (file_exists(m)) {
 			DeleteFileW(m.c_str());
 		}
@@ -912,8 +1028,8 @@ extern "C"
 		for (std::size_t i = 0; i < plugins.size(); ++i) {
 			host_one(c, pf, skse, plugins[i], reports[i]);
 		}
-		if (!g_anyShadow && file_exists(game_dir() + L"Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\_session_open.txt")) {
-			DeleteFileW((game_dir() + L"Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\_session_open.txt").c_str());  // nothing shadowed this session
+		if (file_exists(game_dir() + L"Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\_session_open.txt")) {
+			DeleteFileW((game_dir() + L"Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\_session_open.txt").c_str());  // left by 0.7.0-0.7.2; no longer used
 		}
 		logf("done");
 		return true;

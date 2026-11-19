@@ -532,3 +532,19 @@ lock released. SkyrimVM regressions in both directions unchanged. In game: build
 Limits: only members the plugin reaches through the singleton are translated. A pointer to the player obtained
 another way (event argument, form lookup, `GetSingleton` of a different ID) is the real object and is NOT
 translated. Events later dispatched to the plugin's sink go through the game's own code and are fine.
+
+### 0.7.3 — clean-up: one question per plugin, JSON only
+
+- Field result 0.7.2 [user report]: Rain Extinguishes Fires works on 1.6.1170 (fires go out in rain, frost spells put
+  out campfires). Live response to rain needs a natural weather change; console fw/sw bypass the hooked call.
+- Choices: one Yes/No per plugin covering every fix it needs (present version, shadow VM, shadow player), saved once
+  in ShadowVM\<dll>.json; only fixes not yet in the file are asked about. Removed: Cancel, per-class questions, and the
+  0.7.0 crash marker (_session_open.txt) that re-asked after an interrupted launch (it re-asked on every hang/kill
+  before the main menu, which looked like answers were never saved). A leftover marker is deleted.
+- present_version is detected: REL::Version constants (4 x u16) of known runtimes stored next to each other in the DLL
+  (e.g. REF's std::array{1.7.104, 1.7.99} at file offset 0xBD140) [Verified on REF]. Offered only for plugins loaded
+  natively when the game is not in the list; the highest listed version is reported. [Assumption] A list kept only
+  in code immediates is not found; set "present_version" in the JSON by hand then.
+- Per-plugin ini lines ([VMShadow]/[PlayerShadow]/[PresentVersion] <dll>=) are migrated into the JSON once.
+- Harness [Verified, Wine]: migration, JSON-only run, undecided with ask_on_startup=0, SkyrimVM both directions.
+  The MessageBox path itself needs in-game verification.
