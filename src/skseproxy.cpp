@@ -19,8 +19,13 @@
 // hosted one by name (SKSE does not know it).
 //
 // Serialization (co-save) has the same single-handle problem: SKSE keeps one unique ID and one set of
-// callbacks per handle. Multiplexing co-save records is not done here; the proxy forwards unchanged and
-// logs a WARNING when more than one hosted plugin claims it.
+// callbacks per handle. With cosave_multiplex=1 the bridge owns the co-save slot itself (unique ID 'SKBR')
+// and gives every hosted plugin its own sub-space inside it: each hosted record is stored as an SKSE record
+// whose type is the hosted plugin's unique ID, whose version is the hosted record's version, and whose data
+// is [hosted record type (4 bytes)][hosted data]. Load splits them back and calls each hosted plugin's load
+// callback with only its own records. Records of hosted plugins that are not installed are kept and written
+// back unchanged, so removing a plugin for one session does not erase its data. With cosave_multiplex=0 the
+// proxy forwards unchanged and warns when more than one hosted plugin claims the co-save.
 //
 // Layouts: CommonLibSSE-NG 539d4ce include/SKSE/Impl/Stubs.h (SKSEMessagingInterface,
 // SKSESerializationInterface), include/SKSE/Interfaces.h:261-267 (Message), interface IDs
@@ -110,6 +115,7 @@ namespace bridge
 		MessagingIface            g_proxyMsg{};
 		SerializationIface*       g_realSer = nullptr;
 		SerializationIface        g_proxySer{};
+		bool                      g_mux = false;  // co-save multiplexing
 		SRWLOCK                   g_lock = SRWLOCK_INIT;
 		std::vector<Listener>     g_listeners;
 		std::vector<std::string>  g_registered;  // senders the bridge registered with SKSE (lowercase; "" = all)
@@ -333,7 +339,7 @@ namespace bridge
 			}
 			ReleaseSRWLockExclusive(&g_lock);
 			logf("[serialization] %s: %s", plugin.c_str(), what);
-			if (!known && owners > 1) {
+			if (!known && owners > 1 && !g_mux) {
 				logf("[serialization] WARNING: %zu hosted plugins use the co-save (%s). SKSE keeps one unique ID and one set of "
 					 "callbacks per plugin handle and they all share the bridge's handle: the last one to register wins, the others "
 					 "do not save or load their co-save data. Host only one co-save plugin per bridge.",
@@ -341,18 +347,306 @@ namespace bridge
 			}
 		}
 
+		// ---- co-save multiplexer ----
+		constexpr std::uint32_t kMuxUid = (std::uint32_t('S') << 24) | (std::uint32_t('K') << 16) | (std::uint32_t('B') << 8) | std::uint32_t('R');
+		using SerCb = void (*)(SerializationIface*);
+		using DelCb = void (*)(std::uint64_t);
+
+		struct Slot
+		{
+			std::string   plugin;
+			std::uint32_t uid{ 0 };
+			SerCb         revert{ nullptr }, save{ nullptr }, load{ nullptr };
+			DelCb         del{ nullptr };
+			unsigned      saved{ 0 }, loaded{ 0 };
+		};
+
+		struct Rec
+		{
+			std::uint32_t              uid, version;
+			std::vector<std::uint8_t> data;  // [inner type][inner data]
+		};
+
+		bool                      g_muxRegistered = false;
+		std::vector<Slot>         g_slots;
+		std::vector<Rec>          g_orphans;   // records of hosted plugins not present this session
+		int                       g_cur = -1;  // slot whose callback is running
+		bool                      g_open = false;
+		std::uint32_t             g_openType = 0, g_openVer = 0;
+		std::vector<std::uint8_t> g_openBuf;
+		std::vector<const Rec*>   g_loadList;
+		std::size_t               g_loadIdx = 0, g_readPos = 0;
+		bool                      g_loadHas = false;
+
+		using WriteRecordFn = bool (*)(std::uint32_t, std::uint32_t, const void*, std::uint32_t);
+		using GetNextFn = bool (*)(std::uint32_t*, std::uint32_t*, std::uint32_t*);
+		using ReadFn = std::uint32_t (*)(void*, std::uint32_t);
+		WriteRecordFn real_write() { return reinterpret_cast<WriteRecordFn>(g_realSer->rest[0]); }
+		GetNextFn     real_next() { return reinterpret_cast<GetNextFn>(g_realSer->rest[3]); }
+		ReadFn        real_read() { return reinterpret_cast<ReadFn>(g_realSer->rest[4]); }
+
+		std::string fourcc(std::uint32_t v)
+		{
+			char b[16];
+			const auto ch = [](std::uint32_t x) { x &= 0xFF; return static_cast<char>(x >= 0x20 && x < 0x7F ? x : '?'); };
+			std::snprintf(b, sizeof(b), "'%c%c%c%c'", ch(v >> 24), ch(v >> 16), ch(v >> 8), ch(v));
+			return b;
+		}
+
+		bool write_wrapped(std::uint32_t type, std::uint32_t ver, const void* data, std::uint32_t len)
+		{
+			if (g_cur < 0) {
+				return false;
+			}
+			std::vector<std::uint8_t> buf(4 + static_cast<std::size_t>(len));
+			std::memcpy(buf.data(), &type, 4);
+			if (len) {
+				std::memcpy(buf.data() + 4, data, len);
+			}
+			const bool ok = real_write()(g_slots[g_cur].uid, ver, buf.data(), static_cast<std::uint32_t>(buf.size()));
+			g_slots[g_cur].saved += ok;
+			return ok;
+		}
+
+		void flush_open()
+		{
+			if (g_open) {
+				g_open = false;
+				write_wrapped(g_openType, g_openVer, g_openBuf.data(), static_cast<std::uint32_t>(g_openBuf.size()));
+				g_openBuf.clear();
+			}
+		}
+
+		bool mux_write_record(std::uint32_t type, std::uint32_t ver, const void* data, std::uint32_t len)
+		{
+			flush_open();
+			return write_wrapped(type, ver, data, len);
+		}
+
+		bool mux_open_record(std::uint32_t type, std::uint32_t ver)
+		{
+			if (g_cur < 0) {
+				return false;
+			}
+			flush_open();
+			g_open = true;
+			g_openType = type;
+			g_openVer = ver;
+			g_openBuf.clear();
+			return true;
+		}
+
+		bool mux_write_data(const void* data, std::uint32_t len)
+		{
+			if (!g_open) {
+				return false;
+			}
+			const auto* p = static_cast<const std::uint8_t*>(data);
+			g_openBuf.insert(g_openBuf.end(), p, p + len);
+			return true;
+		}
+
+		bool mux_next(std::uint32_t* type, std::uint32_t* ver, std::uint32_t* len)
+		{
+			if (!g_loadHas) {
+				return false;
+			}
+			if (g_loadIdx >= g_loadList.size()) {
+				return false;
+			}
+			const Rec* r = g_loadList[g_loadIdx++];
+			std::uint32_t t = 0;
+			std::memcpy(&t, r->data.data(), 4);
+			if (type) *type = t;
+			if (ver) *ver = r->version;
+			if (len) *len = static_cast<std::uint32_t>(r->data.size() - 4);
+			g_readPos = 4;
+			return true;
+		}
+
+		std::uint32_t mux_read(void* buf, std::uint32_t len)
+		{
+			if (!g_loadHas || g_loadIdx == 0) {
+				return 0;
+			}
+			const Rec*        r = g_loadList[g_loadIdx - 1];
+			const std::size_t n = std::min<std::size_t>(len, r->data.size() - g_readPos);
+			std::memcpy(buf, r->data.data() + g_readPos, n);
+			g_readPos += n;
+			return static_cast<std::uint32_t>(n);
+		}
+
+		void mux_save_cb(SerializationIface*)
+		{
+			for (std::size_t i = 0; i < g_slots.size(); ++i) {
+				if (!g_slots[i].save || !g_slots[i].uid) {
+					continue;
+				}
+				g_cur = static_cast<int>(i);
+				g_slots[i].saved = 0;
+				g_slots[i].save(&g_proxySer);
+				flush_open();
+				g_cur = -1;
+				logf("[cosave] save: %s %s wrote %u record(s)", g_slots[i].plugin.c_str(), fourcc(g_slots[i].uid).c_str(), g_slots[i].saved);
+			}
+			for (const auto& r : g_orphans) {
+				real_write()(r.uid, r.version, r.data.data(), static_cast<std::uint32_t>(r.data.size()));
+			}
+			if (!g_orphans.empty()) {
+				logf("[cosave] save: kept %zu record(s) of hosted plugins not loaded this session", g_orphans.size());
+			}
+		}
+
+		void mux_load_cb(SerializationIface*)
+		{
+			std::vector<Rec> recs;
+			std::uint32_t    uid = 0, ver = 0, len = 0;
+			while (real_next()(&uid, &ver, &len)) {
+				Rec r{ uid, ver, std::vector<std::uint8_t>(len) };
+				const std::uint32_t got = len ? real_read()(r.data.data(), len) : 0;
+				r.data.resize(got);
+				if (r.data.size() >= 4) {
+					recs.push_back(std::move(r));
+				}
+			}
+			g_orphans.clear();
+			for (const auto& r : recs) {
+				bool owned = false;
+				for (const auto& sl : g_slots) {
+					owned = owned || (sl.uid == r.uid && sl.load);
+				}
+				if (!owned) {
+					g_orphans.push_back(r);
+				}
+			}
+			for (std::size_t i = 0; i < g_slots.size(); ++i) {
+				auto& sl = g_slots[i];
+				if (!sl.load || !sl.uid) {
+					continue;
+				}
+				g_loadList.clear();
+				for (const auto& r : recs) {
+					if (r.uid == sl.uid) {
+						g_loadList.push_back(&r);
+					}
+				}
+				if (g_loadList.empty()) {
+					continue;  // SKSE calls a load callback only when the plugin has data in the co-save
+				}
+				g_loadIdx = 0;
+				g_readPos = 0;
+				g_loadHas = true;
+				g_cur = static_cast<int>(i);
+				sl.load(&g_proxySer);
+				g_cur = -1;
+				g_loadHas = false;
+				logf("[cosave] load: %s %s got %zu record(s), read %zu", sl.plugin.c_str(), fourcc(sl.uid).c_str(), g_loadList.size(), g_loadIdx);
+			}
+			g_loadList.clear();
+			if (!g_orphans.empty()) {
+				logf("[cosave] load: %zu record(s) belong to hosted plugins not loaded this session; kept for the next save", g_orphans.size());
+			}
+		}
+
+		void mux_revert_cb(SerializationIface*)
+		{
+			g_orphans.clear();
+			for (std::size_t i = 0; i < g_slots.size(); ++i) {
+				if (g_slots[i].revert) {
+					g_cur = static_cast<int>(i);
+					g_slots[i].revert(&g_proxySer);
+					g_cur = -1;
+				}
+			}
+		}
+
+		void mux_delete_cb(std::uint64_t handle)
+		{
+			for (const auto& sl : g_slots) {
+				if (sl.del) {
+					sl.del(handle);
+				}
+			}
+		}
+
+		void mux_register()
+		{
+			if (g_muxRegistered) {
+				return;
+			}
+			g_muxRegistered = true;
+			g_realSer->SetUniqueID(g_hostHandle, kMuxUid);
+			g_realSer->SetRevertCallback(g_hostHandle, reinterpret_cast<void*>(&mux_revert_cb));
+			g_realSer->SetSaveCallback(g_hostHandle, reinterpret_cast<void*>(&mux_save_cb));
+			g_realSer->SetLoadCallback(g_hostHandle, reinterpret_cast<void*>(&mux_load_cb));
+			g_realSer->SetFormDeleteCallback(g_hostHandle, reinterpret_cast<void*>(&mux_delete_cb));
+			logf("[cosave] bridge registered co-save %s; hosted plugins get one sub-space each, keyed by their own unique ID",
+				fourcc(kMuxUid).c_str());
+		}
+
+		Slot& slot_for(const std::string& plugin)
+		{
+			for (auto& sl : g_slots) {
+				if (sl.plugin == plugin) {
+					return sl;
+				}
+			}
+			g_slots.push_back({});
+			g_slots.back().plugin = plugin;
+			return g_slots.back();
+		}
+
 		void ser_uid(std::uint32_t h, std::uint32_t uid)
 		{
 			char buf[64];
 			std::snprintf(buf, sizeof(buf), "SetUniqueID('%c%c%c%c')", static_cast<char>(uid >> 24), static_cast<char>(uid >> 16),
 				static_cast<char>(uid >> 8), static_cast<char>(uid));
-			note_serialization(BRIDGE_CALLER(), buf);
-			g_realSer->SetUniqueID(h, uid);
+			const void* ret = BRIDGE_CALLER();
+			note_serialization(ret, buf);
+			if (!g_mux) {
+				g_realSer->SetUniqueID(h, uid);
+				return;
+			}
+			const std::string plugin = caller_name(ret);
+			for (const auto& sl : g_slots) {
+				if (sl.uid == uid && sl.plugin != plugin) {
+					logf("[cosave] WARNING: %s and %s both use unique ID %s; their records will be mixed", sl.plugin.c_str(), plugin.c_str(),
+						fourcc(uid).c_str());
+				}
+			}
+			if (uid == kMuxUid) {
+				logf("[cosave] WARNING: %s uses the bridge's own unique ID %s", plugin.c_str(), fourcc(uid).c_str());
+			}
+			slot_for(plugin).uid = uid;
+			mux_register();
 		}
-		void ser_revert(std::uint32_t h, void* cb) { note_serialization(BRIDGE_CALLER(), "SetRevertCallback"); g_realSer->SetRevertCallback(h, cb); }
-		void ser_save(std::uint32_t h, void* cb) { note_serialization(BRIDGE_CALLER(), "SetSaveCallback"); g_realSer->SetSaveCallback(h, cb); }
-		void ser_load(std::uint32_t h, void* cb) { note_serialization(BRIDGE_CALLER(), "SetLoadCallback"); g_realSer->SetLoadCallback(h, cb); }
-		void ser_delete(std::uint32_t h, void* cb) { note_serialization(BRIDGE_CALLER(), "SetFormDeleteCallback"); g_realSer->SetFormDeleteCallback(h, cb); }
+		template <class F>
+		void ser_set(const void* ret, const char* what, std::uint32_t h, void* cb, void (*SerializationIface::*realFn)(std::uint32_t, void*), F apply)
+		{
+			note_serialization(ret, what);
+			if (!g_mux) {
+				(g_realSer->*realFn)(h, cb);
+				return;
+			}
+			apply(slot_for(caller_name(ret)), cb);
+			mux_register();
+		}
+		void ser_revert(std::uint32_t h, void* cb)
+		{
+			ser_set(BRIDGE_CALLER(), "SetRevertCallback", h, cb, &SerializationIface::SetRevertCallback, [](Slot& s, void* c) { s.revert = reinterpret_cast<SerCb>(c); });
+		}
+		void ser_save(std::uint32_t h, void* cb)
+		{
+			ser_set(BRIDGE_CALLER(), "SetSaveCallback", h, cb, &SerializationIface::SetSaveCallback, [](Slot& s, void* c) { s.save = reinterpret_cast<SerCb>(c); });
+		}
+		void ser_load(std::uint32_t h, void* cb)
+		{
+			ser_set(BRIDGE_CALLER(), "SetLoadCallback", h, cb, &SerializationIface::SetLoadCallback, [](Slot& s, void* c) { s.load = reinterpret_cast<SerCb>(c); });
+		}
+		void ser_delete(std::uint32_t h, void* cb)
+		{
+			ser_set(BRIDGE_CALLER(), "SetFormDeleteCallback", h, cb, &SerializationIface::SetFormDeleteCallback, [](Slot& s, void* c) { s.del = reinterpret_cast<DelCb>(c); });
+		}
 
 		void* proxy_query(std::uint32_t id)
 		{
@@ -366,7 +660,7 @@ namespace bridge
 		}
 	}
 
-	void skse_proxy_init(const SKSEInterface* real, bool fanout)
+	void skse_proxy_init(const SKSEInterface* real, bool fanout, bool cosaveMux)
 	{
 		g_real = real;
 		g_realQuery = real->QueryInterface;
@@ -388,10 +682,19 @@ namespace bridge
 			g_proxySer.SetSaveCallback = &ser_save;
 			g_proxySer.SetLoadCallback = &ser_load;
 			g_proxySer.SetFormDeleteCallback = &ser_delete;
+			g_mux = cosaveMux;
+			if (g_mux) {
+				g_proxySer.rest[0] = reinterpret_cast<void*>(&mux_write_record);
+				g_proxySer.rest[1] = reinterpret_cast<void*>(&mux_open_record);
+				g_proxySer.rest[2] = reinterpret_cast<void*>(&mux_write_data);
+				g_proxySer.rest[3] = reinterpret_cast<void*>(&mux_next);
+				g_proxySer.rest[4] = reinterpret_cast<void*>(&mux_read);
+				// rest[5] ResolveHandle, rest[6] ResolveFormId: forwarded (valid while the bridge's load callback runs)
+			}
 		}
 		logf("skse proxy: host handle %u, messaging %s (v%u), serialization %s", g_hostHandle,
 			g_realMsg ? (fanout ? "fan-out" : "pass-through") : "unavailable", g_realMsg ? g_realMsg->interfaceVersion : 0,
-			g_realSer ? "monitored" : "unavailable");
+			g_realSer ? (g_mux ? "multiplexed" : "monitored") : "unavailable");
 	}
 
 	void skse_proxy_add_module(HMODULE mod, const std::string& name)

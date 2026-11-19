@@ -44,6 +44,8 @@ installed.
    ```
    Data\SKSE\Plugins\Legacy\
    ```
+   Only the DLL moves. Leave the plugin's ini files and data folders where the mod installs them
+   (`Data\SKSE\Plugins\...`); since 0.5.0 the hosted plugin is told it lives there.
 5. Launch the game and check whether the plugins work (see Troubleshooting).
 
 **Important:** only put plugins in `Legacy\` that you want SKSE-Bridge to host. Plugins that SKSE should
@@ -58,6 +60,7 @@ Tested on Skyrim 1.7.104 with SKSE 2.3.1.
 | RTL-SUPPORT-NG | Loads and applies its XML translations |
 | PickPocketRedone-NG | Loads and works |
 | CompassNavigationOverhaul + InfinityUI | Compatibility work added in 0.3.0; in-game testing still in progress |
+| Improved Camera SE 1.1.2 | Loads and runs since 0.4.0; a few features are disabled by the patch guard (see log) |
 
 Other plugins have not been tested. Results vary with each plugin's implementation.
 
@@ -81,10 +84,22 @@ own code.
   instead of crashing the game later. The plugin still needs a rebuild for full function.
 - **Shared SKSE identity.** Hosted plugins share the bridge's SKSE plugin handle. Messaging is handled by the
   bridge (hosted plugins can message each other, for example CompassNavigationOverhaul and InfinityUI), but
-  plugins loaded by SKSE itself cannot reach a hosted plugin by name. The co-save is shared too, so host
-  only one plugin that stores its own co-save data. The log warns if a second one tries.
+  plugins loaded by SKSE itself cannot reach a hosted plugin by name.
+- **Co-save.** Since 0.5.0 the bridge owns one co-save slot (`'SKBR'`) and gives each hosted plugin its own
+  sub-space in it, so several hosted plugins can save. Co-save data a hosted plugin wrote with 0.4.0 or
+  earlier (or with `cosave_multiplex=0`) was stored under that plugin's own ID and is not read by the new
+  layout; expect that plugin to start fresh once.
 - **Supported lineage.** Only plugins built with the CommonLibSSE-NG lineage are understood. Others are
   skipped unless `force=1` is set.
+
+## What's new in 0.5.0
+
+- Co-save sub-spaces: every hosted plugin saves and loads its own records inside the bridge's co-save slot.
+  Records of a hosted plugin that is missing for a session are kept and written back.
+- Hosted plugins see their normal path (`Data\SKSE\Plugins\<name>.dll`), so ini files and data folders
+  installed next to that location are found.
+- Patch guard refines its check: a 2-byte patch over a short jump, a 6-byte patch over a near conditional
+  jump or a virtual call are recognised; per-plugin allow-list `Legacy\compat\<plugin>.patches`.
 
 ## What's new in 0.4.0
 
@@ -117,9 +132,12 @@ own code.
 | `[Diagnostics] verify_ids`, `rtti_scan`, `fault_log` | Extra checks written to the log |
 | `[Diagnostics] patch_audit` | Log every write hosted plugins make into the game exe (`[patch]` lines) |
 | `[Compatibility] patch_guard` | `1` = refuse writes that would land on the wrong game code (default); `0` = log only |
+| `[Compatibility] present_plugin_path` | `1` = hosted DLLs see themselves in `Data\SKSE\Plugins\` (default) |
+| `[Compatibility] cosave_multiplex` | `1` = one co-save sub-space per hosted plugin (default) |
 
 Optional per-plugin files in `Legacy\compat\`: `<plugin>.ids` (ID overrides, one `legacyID = newID` per
-line) and `<plugin>.check` (paste the IDs your plugin uses and the log reports each one).
+line), `<plugin>.check` (paste the IDs your plugin uses and the log reports each one) and
+`<plugin>.patches` (`allow <ID>+0x<offset>` per line: patch sites you checked that the guard must not refuse).
 
 ## Troubleshooting
 

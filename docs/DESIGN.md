@@ -287,3 +287,54 @@ Blocking removes features; it does not make the plugin correct. Rebuilding for 1
 changed function → BLOCKED; 14-byte write at function start → ok; 2-byte payload in changed function →
 BLOCKED; vtable slot 1 → ok; vtable slot 4 → BLOCKED ("meant the function that is now slot 6"). Old
 harness (OldPlugin) unchanged. Builds; needs in-game verification.
+
+
+## Stage 9 — 0.5.0: co-save sub-spaces, presented module path, sharper patch guard (2026-11-19)
+
+### IC sites checked against the real 1.7.104 SkyrimSE.exe [Verified]
+`example-sources/skyrim/SkyrimSE.exe` (1.7.104, read-only, disassembled with capstone at AL 1.7.104 offsets):
+
+| site | 1.7.104 instruction at the offset | 0.4.0 verdict | correct? |
+|---|---|---|---|
+| TESObjectCell_Get3D 19165+0x7B (6-byte) | **inside** `call [rax+0x468]`, which starts at +0x7A | blocked | yes, would cut an instruction |
+| SmoothAnimationTransitions 41996+0x2F4 (6-byte) | **inside** `je`, which starts at +0x2F3 | blocked | yes |
+| HorseLookingDownFix1 37356+0xB64 (2-byte `66 90`) | `ja short` (`77 10`), instruction start | blocked | no: false positive |
+| TogglePOVHandler vtable slot 4 | slot moved (PlayerInputHandler +2@2) | blocked | yes |
+| all other IC sites | calls / jcc / movss at instruction starts | ok | yes |
+
+So the save-load crash in 0.3.0 was the TESObjectCell or SmoothAnimation hook writing into the middle of an
+instruction. 0.5.0 recognises the instruction shapes byte patches usually replace (2-byte short jump,
+6-byte `0F 8x` jcc, 6-byte `FF 9x` virtual call) so HorseLookingDownFix1 is now allowed (with a warning).
+Remapping a misplaced hook to the right offset (+0x7A) is not done: it would mean rewriting the plugin's
+write and its saved original-call pointer, which is the binary rewriting this project excludes.
+
+### Co-save sub-spaces (`src/skseproxy.cpp`, `cosave_multiplex=1`)
+SKSE keeps one unique ID and one callback set per plugin handle; all hosted plugins share the bridge's handle.
+The bridge now registers itself once as `'SKBR'` and keeps one slot per hosted plugin (caller attribution as
+for messaging). Its save callback calls each hosted save callback with a proxy interface:
+`WriteRecord(type, ver, data)` and `OpenRecord`+`WriteRecordData` become one SKSE record
+`(type = hosted unique ID, version = ver, data = [type][data])`. Its load callback reads every record,
+groups them by hosted unique ID and calls each hosted load callback with a proxy whose
+`GetNextRecordInfo`/`ReadRecordData` serve only that plugin's records; `ResolveFormId`/`ResolveHandle` are
+forwarded (valid while the bridge's load callback runs). Revert and form-delete fan out. Records whose
+unique ID no hosted plugin claims are kept and written back unchanged. Layout: NG 539d4ce
+`SKSESerializationInterface` [Verified]. SKSE's own co-save keying by unique ID [Assumption: from SKSE's
+documented API, not its 1.7.104 binary].
+Migration: data a hosted plugin saved before 0.5.0 sits under its own ID in SKSE's file; SKSE only hands the
+bridge the `'SKBR'` chunk, so that data is not read [Assumption, same source].
+
+### Presented module path (`src/interpose.cpp`, `present_plugin_path=1`)
+Hosted DLLs live in `Legacy\`; their ini/data files are installed next to `Data\SKSE\Plugins\`. The hosted
+module's `GetModuleFileNameW/A` for its own handle returns `Data\SKSE\Plugins\<file>`. Calls it may make with
+that path for its own DLL (`GetFileVersionInfo[Size]W/A`, `LoadLibrary[Ex]W/A`, `GetModuleHandleW/A`,
+`CreateFileW/A`, `GetFileAttributesW/A`) are mapped back to the real file. Limit: file access through the
+dynamic CRT (fopen, std::ifstream, std::filesystem) runs in ucrtbase.dll, not in the plugin's import table,
+and is not mapped; it only matters for the plugin's own DLL path, which plugins rarely open that way.
+
+### Harness (Wine)
+Two co-save plugins with different IDs, both `WriteRecord` and `OpenRecord`/`WriteRecordData`: mock SKSE sees
+one chunk `'SKBR'` with 4 records; after revert+load each plugin reads exactly its own 2 records (values,
+lengths, ResolveFormId forwarded); second save round-trips. Presented path: `GetModuleFileNameW` →
+`Data\SKSE\Plugins\X.dll`; `LoadLibraryW` of that path returns the same module; `GetFileAttributesW` finds it.
+Patch guard: 2-byte write over `ja short` in a changed function → warned and written; over `CC` → blocked;
+allow-listed mid-instruction 5-byte write → written. Old harness unchanged. Builds; needs in-game verification.

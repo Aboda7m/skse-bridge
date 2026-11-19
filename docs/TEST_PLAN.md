@@ -87,3 +87,14 @@ Done (Wine, synthetic): see DESIGN Stage 8 "Harness". In game, with Improved Cam
    and POV-toggle tracking. Report what else misbehaves.
 3. Negative control: `patch_guard=0` must reproduce the crash; the `[patch] ... UNSAFE` lines show which.
 4. Every other hosted plugin: `[patch] summary` should show 0 blocked for plugins that worked before.
+
+
+## 0.5.0 in game
+
+1. Improved Camera SE: `[patch] summary` should read 3 blocked (TESObjectCell 19165+0x7B, SmoothAnimation
+   41996+0x2F4, TogglePOVHandler slot 4); HorseLookingDownFix1 now `WARNING ... short jump ... is there`.
+2. Co-save: host two plugins that use the co-save. Save, quit to desktop, reload. Log: `[cosave] save: <plugin>
+   wrote N record(s)` and `[cosave] load: <plugin> got N record(s), read N` for each. Check the plugins' own data.
+3. Remove one of them, load and save, put it back, load: its data must come back (`kept ... record(s)` lines).
+4. Presented path: a plugin with an ini next to `Data\SKSE\Plugins\`: its settings take effect; the log line
+   `module path presented to the plugin` names that path.

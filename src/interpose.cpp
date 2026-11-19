@@ -61,6 +61,138 @@ namespace bridge
 			return found;
 		}
 
+		// ---- presented module path ----
+		// A hosted DLL lives in Legacy\, but its files (ini, data folder) are installed by mod managers next to where
+		// the DLL normally sits, Data\SKSE\Plugins\. Plugins that locate their files from their own module path
+		// (GetModuleFileName) are shown that normal path. Functions the plugin may call with that path for the DLL
+		// itself (version info, LoadLibrary, GetModuleHandle, CreateFile, GetFileAttributes) are mapped back to the
+		// real file, so nothing it does with its own path breaks.
+		std::wstring norm(std::wstring_view p)
+		{
+			std::wstring r(p);
+			std::replace(r.begin(), r.end(), L'/', L'\\');
+			return r;
+		}
+
+		// If `path` is the presented path of a hosted DLL, its real path; otherwise empty.
+		std::wstring real_for(const wchar_t* path)
+		{
+			if (!path) {
+				return {};
+			}
+			const std::wstring p = norm(path);
+			std::wstring       out;
+			AcquireSRWLockShared(&g_lock);
+			for (const auto& m : g_modules) {
+				if (!m.cfg.presentPath.empty() && iequals(p, m.cfg.presentPath)) {
+					out = m.cfg.realPath;
+					break;
+				}
+			}
+			ReleaseSRWLockShared(&g_lock);
+			return out;
+		}
+
+		std::string real_for_a(const char* path)
+		{
+			if (!path) {
+				return {};
+			}
+			wchar_t w[MAX_PATH * 2]{};
+			if (!MultiByteToWideChar(CP_ACP, 0, path, -1, w, static_cast<int>(std::size(w)))) {
+				return {};
+			}
+			const std::wstring r = real_for(w);
+			if (r.empty()) {
+				return {};
+			}
+			char a[MAX_PATH * 4]{};
+			WideCharToMultiByte(CP_ACP, 0, r.c_str(), -1, a, static_cast<int>(sizeof(a)), nullptr, nullptr);
+			return a;
+		}
+
+		bool presented_for(HMODULE h, std::wstring& out)
+		{
+			if (!h) {
+				return false;
+			}
+			const auto a = reinterpret_cast<std::uintptr_t>(h);
+			bool       found = false;
+			AcquireSRWLockShared(&g_lock);
+			for (const auto& m : g_modules) {
+				if (m.base == a && !m.cfg.presentPath.empty()) {
+					out = m.cfg.presentPath;
+					found = true;
+					break;
+				}
+			}
+			ReleaseSRWLockShared(&g_lock);
+			return found;
+		}
+
+		DWORD WINAPI Hook_GetModuleFileNameW(HMODULE h, LPWSTR buf, DWORD n)
+		{
+			std::wstring p;
+			if (!buf || !n || !presented_for(h, p)) {
+				return ::GetModuleFileNameW(h, buf, n);
+			}
+			const DWORD len = static_cast<DWORD>(p.size());
+			if (len < n) {
+				std::wmemcpy(buf, p.c_str(), len + 1);
+				SetLastError(ERROR_SUCCESS);
+				return len;
+			}
+			std::wmemcpy(buf, p.c_str(), n - 1);
+			buf[n - 1] = 0;
+			SetLastError(ERROR_INSUFFICIENT_BUFFER);
+			return n;
+		}
+
+		DWORD WINAPI Hook_GetModuleFileNameA(HMODULE h, LPSTR buf, DWORD n)
+		{
+			std::wstring p;
+			if (!buf || !n || !presented_for(h, p)) {
+				return ::GetModuleFileNameA(h, buf, n);
+			}
+			char a[MAX_PATH * 4]{};
+			WideCharToMultiByte(CP_ACP, 0, p.c_str(), -1, a, static_cast<int>(sizeof(a)), nullptr, nullptr);
+			const DWORD len = static_cast<DWORD>(std::strlen(a));
+			if (len < n) {
+				std::memcpy(buf, a, len + 1);
+				SetLastError(ERROR_SUCCESS);
+				return len;
+			}
+			std::memcpy(buf, a, n - 1);
+			buf[n - 1] = 0;
+			SetLastError(ERROR_INSUFFICIENT_BUFFER);
+			return n;
+		}
+
+#define BRIDGE_MAPW(arg) const std::wstring mapped_ = real_for(arg); const wchar_t* const arg##_ = mapped_.empty() ? (arg) : mapped_.c_str()
+#define BRIDGE_MAPA(arg) const std::string mapped_ = real_for_a(arg); const char* const arg##_ = mapped_.empty() ? (arg) : mapped_.c_str()
+
+		DWORD WINAPI Hook_GetFileVersionInfoSizeW(LPCWSTR file, LPDWORD h) { BRIDGE_MAPW(file); return ::GetFileVersionInfoSizeW(file_, h); }
+		DWORD WINAPI Hook_GetFileVersionInfoSizeA(LPCSTR file, LPDWORD h) { BRIDGE_MAPA(file); return ::GetFileVersionInfoSizeA(file_, h); }
+		HMODULE WINAPI Hook_LoadLibraryW(LPCWSTR file) { BRIDGE_MAPW(file); return ::LoadLibraryW(file_); }
+		HMODULE WINAPI Hook_LoadLibraryA(LPCSTR file) { BRIDGE_MAPA(file); return ::LoadLibraryA(file_); }
+		HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR file, HANDLE f, DWORD fl) { BRIDGE_MAPW(file); return ::LoadLibraryExW(file_, f, fl); }
+		HMODULE WINAPI Hook_LoadLibraryExA(LPCSTR file, HANDLE f, DWORD fl) { BRIDGE_MAPA(file); return ::LoadLibraryExA(file_, f, fl); }
+		HMODULE WINAPI Hook_GetModuleHandleW(LPCWSTR file) { BRIDGE_MAPW(file); return ::GetModuleHandleW(file_); }
+		HMODULE WINAPI Hook_GetModuleHandleA(LPCSTR file) { BRIDGE_MAPA(file); return ::GetModuleHandleA(file_); }
+		DWORD WINAPI Hook_GetFileAttributesW(LPCWSTR file) { BRIDGE_MAPW(file); return ::GetFileAttributesW(file_); }
+		DWORD WINAPI Hook_GetFileAttributesA(LPCSTR file) { BRIDGE_MAPA(file); return ::GetFileAttributesA(file_); }
+		HANDLE WINAPI Hook_CreateFileW(LPCWSTR file, DWORD a, DWORD sh, LPSECURITY_ATTRIBUTES sa, DWORD cd, DWORD fl, HANDLE t)
+		{
+			BRIDGE_MAPW(file);
+			return ::CreateFileW(file_, a, sh, sa, cd, fl, t);
+		}
+		HANDLE WINAPI Hook_CreateFileA(LPCSTR file, DWORD a, DWORD sh, LPSECURITY_ATTRIBUTES sa, DWORD cd, DWORD fl, HANDLE t)
+		{
+			BRIDGE_MAPA(file);
+			return ::CreateFileA(file_, a, sh, sa, cd, fl, t);
+		}
+
+
 		bool is_game_exe(const wchar_t* file)
 		{
 			return file && iequals(base_name(file), base_name(exe_path()));
@@ -118,7 +250,8 @@ namespace bridge
 		BOOL WINAPI Hook_GetFileVersionInfoW(LPCWSTR file, DWORD handle, DWORD len, LPVOID data)
 		{
 			const void* const caller = BRIDGE_RETURN_ADDRESS();
-			const BOOL        ok = ::GetFileVersionInfoW(file, handle, len, data);
+			BRIDGE_MAPW(file);
+			const BOOL        ok = ::GetFileVersionInfoW(file_, handle, len, data);
 			ModuleCtx         ctx;
 			if (ok && data && find_ctx(caller, ctx) && ctx.cfg.spoofVersion && is_game_exe(file)) {
 				mark_block(ctx, data, "GetFileVersionInfoW");
@@ -129,7 +262,8 @@ namespace bridge
 		BOOL WINAPI Hook_GetFileVersionInfoA(LPCSTR file, DWORD handle, DWORD len, LPVOID data)
 		{
 			const void* const caller = BRIDGE_RETURN_ADDRESS();
-			const BOOL        ok = ::GetFileVersionInfoA(file, handle, len, data);
+			BRIDGE_MAPA(file);
+			const BOOL        ok = ::GetFileVersionInfoA(file_, handle, len, data);
 			ModuleCtx         ctx;
 			if (ok && data && file && find_ctx(caller, ctx) && ctx.cfg.spoofVersion) {
 				// ANSI path: convert with the ANSI code page, as the A API itself does.
@@ -239,6 +373,7 @@ namespace bridge
 			}
 			return ::CreateFileMappingW(file, sa, protect, hi, lo, name);
 		}
+
 
 		// Patch audit (patchaudit.cpp): sees every VirtualProtect the hosted plugin makes on SkyrimSE.exe and may refuse
 		// one that would write over the wrong game code. Calls on any other memory pass straight through.
@@ -352,6 +487,32 @@ namespace bridge
 		}
 		r.openFileMappingW = patch_iat(legacy, "OpenFileMappingW", reinterpret_cast<void*>(&Hook_OpenFileMappingW));
 		r.createFileMappingW = patch_iat(legacy, "CreateFileMappingW", reinterpret_cast<void*>(&Hook_CreateFileMappingW));
+		if (!cfg.presentPath.empty()) {
+			const std::pair<const char*, void*> pathHooks[] = {
+				{ "GetModuleFileNameW", reinterpret_cast<void*>(&Hook_GetModuleFileNameW) },
+				{ "GetModuleFileNameA", reinterpret_cast<void*>(&Hook_GetModuleFileNameA) },
+				{ "GetFileVersionInfoSizeW", reinterpret_cast<void*>(&Hook_GetFileVersionInfoSizeW) },
+				{ "GetFileVersionInfoSizeA", reinterpret_cast<void*>(&Hook_GetFileVersionInfoSizeA) },
+				{ "LoadLibraryW", reinterpret_cast<void*>(&Hook_LoadLibraryW) },
+				{ "LoadLibraryA", reinterpret_cast<void*>(&Hook_LoadLibraryA) },
+				{ "LoadLibraryExW", reinterpret_cast<void*>(&Hook_LoadLibraryExW) },
+				{ "LoadLibraryExA", reinterpret_cast<void*>(&Hook_LoadLibraryExA) },
+				{ "GetModuleHandleW", reinterpret_cast<void*>(&Hook_GetModuleHandleW) },
+				{ "GetModuleHandleA", reinterpret_cast<void*>(&Hook_GetModuleHandleA) },
+				{ "GetFileAttributesW", reinterpret_cast<void*>(&Hook_GetFileAttributesW) },
+				{ "GetFileAttributesA", reinterpret_cast<void*>(&Hook_GetFileAttributesA) },
+				{ "CreateFileW", reinterpret_cast<void*>(&Hook_CreateFileW) },
+				{ "CreateFileA", reinterpret_cast<void*>(&Hook_CreateFileA) },
+			};
+			for (const auto& [fn, hook] : pathHooks) {
+				r.modulePath += patch_iat(legacy, fn, hook);
+			}
+			// The version-info hooks also map the path; install them even when the version spoof is off.
+			if (!cfg.spoofVersion) {
+				r.modulePath += patch_iat(legacy, "GetFileVersionInfoW", reinterpret_cast<void*>(&Hook_GetFileVersionInfoW));
+				r.modulePath += patch_iat(legacy, "GetFileVersionInfoA", reinterpret_cast<void*>(&Hook_GetFileVersionInfoA));
+			}
+		}
 		if (cfg.patchAudit) {
 			r.virtualProtect = patch_iat(legacy, "VirtualProtect", reinterpret_cast<void*>(&Hook_VirtualProtect));
 		}

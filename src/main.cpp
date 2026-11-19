@@ -12,7 +12,7 @@ namespace bridge
 {
 	namespace
 	{
-		constexpr Version kHostVersion{ { 0, 4, 0, 0 } };
+		constexpr Version kHostVersion{ { 0, 5, 0, 0 } };
 
 		struct Config
 		{
@@ -31,6 +31,8 @@ namespace bridge
 			bool                      messagingFanout{ true };
 			bool                      patchAudit{ true };
 			bool                      patchGuard{ true };
+			bool                      presentPluginPath{ true };
+			bool                      cosaveMux{ true };
 		};
 
 		struct Preflight
@@ -109,6 +111,8 @@ namespace bridge
 			c.messagingFanout = ini_bool(ini, L"Compatibility", L"messaging_fanout", true);
 			c.patchAudit = ini_bool(ini, L"Diagnostics", L"patch_audit", true);
 			c.patchGuard = ini_bool(ini, L"Compatibility", L"patch_guard", true);
+			c.presentPluginPath = ini_bool(ini, L"Compatibility", L"present_plugin_path", true);
+			c.cosaveMux = ini_bool(ini, L"Compatibility", L"cosave_multiplex", true);
 			logf("config: dry_run=%d legacy_dir=%s plugins=%s", c.dryRun ? 1 : 0, narrow(c.legacyDir).c_str(),
 				c.plugins.empty() ? "*" : narrow(list).c_str());
 			logf("config: translate=%d legacy_runtime=%s spoof_skse_runtime=%d id_table=%d force=%d address_library=%s",
@@ -116,6 +120,7 @@ namespace bridge
 				c.addressLibrary.empty() ? "(auto)" : narrow(c.addressLibrary).c_str());
 			logf("config: verify_ids=%d rtti_scan=%d fault_log=%d patch_audit=%d messaging_fanout=%d patch_guard=%d", c.verifyIds ? 1 : 0,
 				c.rttiScan ? 1 : 0, c.faultLog ? 1 : 0, c.patchAudit ? 1 : 0, c.messagingFanout ? 1 : 0, c.patchGuard ? 1 : 0);
+			logf("config: present_plugin_path=%d cosave_multiplex=%d", c.presentPluginPath ? 1 : 0, c.cosaveMux ? 1 : 0);
 			return c;
 		}
 
@@ -312,6 +317,12 @@ namespace bridge
 				ic.spoofVersion = true;
 				ic.spoof = c.spoof;
 				ic.patchAudit = pf.ok && c.patchAudit;
+				ic.realPath = path;
+				if (c.presentPluginPath) {
+					ic.presentPath = game_dir() + L"Data\\SKSE\\Plugins\\" + file;
+					logf("  module path presented to the plugin: %s (files it opens through that path for its own DLL are mapped back)",
+						narrow(ic.presentPath).c_str());
+				}
 				if (pf.ok && c.idTable) {
 					std::wstring stem = file;
 					if (const auto dot = stem.find_last_of(L'.'); dot != std::wstring::npos) {
@@ -333,6 +344,32 @@ namespace bridge
 					if (!ic.mapping) {
 						logf("  ERROR: could not create the private ID table (GetLastError=%lu)", static_cast<unsigned long>(GetLastError()));
 					}
+				}
+			}
+
+			if (ic.patchAudit) {
+				std::wstring stem = file;
+				if (const auto dot = stem.find_last_of(L'.'); dot != std::wstring::npos) {
+					stem.resize(dot);
+				}
+				const std::wstring allowPath = c.legacyDir + L"compat\\" + stem + L".patches";
+				std::vector<std::uint8_t> raw;
+				std::string               err;
+				if (file_exists(allowPath) && read_file(allowPath, raw, err)) {
+					std::vector<std::pair<std::uint64_t, std::uint64_t>> sites;
+					std::string                                          text(raw.begin(), raw.end());
+					std::size_t                                          pos = 0;
+					while (pos < text.size()) {
+						auto eol = text.find('\n', pos);
+						std::string ln = text.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+						pos = eol == std::string::npos ? text.size() : eol + 1;
+						unsigned long long id = 0, off = 0;
+						if (std::sscanf(ln.c_str(), " allow %llu + %llx", &id, &off) == 2) {
+							sites.emplace_back(id, off);
+						}
+					}
+					patch_audit_allow(narrow(file), sites);
+					logf("  patch allow-list: %zu site(s) from %s", sites.size(), narrow(allowPath).c_str());
 				}
 			}
 
@@ -364,6 +401,9 @@ namespace bridge
 				logf("  interposer (%s): patched slots GetFileVersionInfoW=%d VerQueryValueW=%d GetFileVersionInfoA=%d VerQueryValueA=%d OpenFileMappingW=%d CreateFileMappingW=%d",
 					early.patched ? "early, before DllMain" : "late, after DllMain", ir.getFileVersionInfoW, ir.verQueryValueW,
 					ir.getFileVersionInfoA, ir.verQueryValueA, ir.openFileMappingW, ir.createFileMappingW);
+				if (!ic.presentPath.empty()) {
+					logf("  module path: %d import slot(s) patched", ir.modulePath);
+				}
 				if (ic.patchAudit) {
 					logf("  patch audit: VirtualProtect slots=%d%s", ir.virtualProtect,
 						ir.virtualProtect ? "" : " (plugin does not import VirtualProtect by name; its game-code writes are not seen)");
@@ -403,7 +443,7 @@ namespace bridge
 				logf("  T1 SKSEPlugin_Load raised SEH exception 0x%08lX", code);
 			}
 			if (ic.patchAudit) {
-				patch_audit_flush(("after SKSEPlugin_Load of " + narrow(file)).c_str());
+				patch_audit_flush("after SKSEPlugin_Load", narrow(file));
 			}
 		}
 	}
@@ -446,7 +486,7 @@ extern "C"
 		}
 
 		const Config c = read_config();
-		skse_proxy_init(skse, c.messagingFanout);
+		skse_proxy_init(skse, c.messagingFanout, c.cosaveMux && !c.dryRun);
 		logf("note: assuming SKSE does not scan sub-folders of Data\\SKSE\\Plugins [Assumption]. If skse64.log lists the legacy "
 			 "DLLs itself, move legacy_dir outside Data\\SKSE\\Plugins.");
 

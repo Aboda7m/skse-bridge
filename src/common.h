@@ -224,7 +224,7 @@ namespace bridge
 
 	// ---- skseproxy.cpp : SKSE interfaces handed to hosted plugins ----
 	// Messaging fan-out (every hosted plugin gets every message) and co-save collision warnings.
-	void skse_proxy_init(const SKSEInterface* real, bool messagingFanout);
+	void skse_proxy_init(const SKSEInterface* real, bool messagingFanout, bool cosaveMultiplex);
 	void skse_proxy_add_module(HMODULE mod, const std::string& name);
 	void* (*skse_proxy_query())(std::uint32_t);  // QueryInterface for hosted plugins; null before init
 	// Hosted plugin names (from SKSEPlugin_Version), declared before any is loaded.
@@ -240,6 +240,8 @@ namespace bridge
 		HANDLE  mapping{ nullptr };  // private table, may be null
 		std::size_t mappingBytes{ 0 };
 		bool    patchAudit{ false };  // watch VirtualProtect calls on SkyrimSE.exe (patchaudit.cpp)
+		std::wstring realPath;         // the DLL's actual path (Legacy\<file>)
+		std::wstring presentPath;      // path GetModuleFileName reports for it; empty = real path
 	};
 
 	struct InterposeResult
@@ -251,6 +253,7 @@ namespace bridge
 		int openFileMappingW{ 0 };
 		int createFileMappingW{ 0 };
 		int virtualProtect{ 0 };
+		int modulePath{ 0 };  // GetModuleFileName + path-taking functions that map the presented path back
 	};
 
 	InterposeResult install_interposer(HMODULE legacy, const std::wstring& name, const InterposeConfig& cfg);
@@ -262,7 +265,9 @@ namespace bridge
 	// Called from the VirtualProtect interposer. Returns false if the call must be refused.
 	bool patch_audit_protect(const std::string& module, void* addr, std::size_t size, DWORD newProtect);
 	void patch_audit_after(void* addr, DWORD newProtect, BOOL ok);
-	void patch_audit_flush(const char* when);  // logs writes whose protection was never restored, and a summary
+	// compat\<plugin>.patches: "allow <ID>+0x<offset>" lines; such writes are never blocked.
+	void patch_audit_allow(const std::string& module, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& sites);
+	void patch_audit_flush(const char* when, const std::string& onlyModule = {});  // logs writes whose protection was never restored, and a summary
 
 	// ---- earlyload.cpp : patch a legacy module before its DllMain / static initializers run ----
 	struct EarlyResult

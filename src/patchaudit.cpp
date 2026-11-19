@@ -65,6 +65,7 @@ namespace bridge
 		std::vector<std::uint64_t>    g_legCommon;  // legacy offsets of the same IDs, sorted
 		std::vector<Pending>          g_pending;
 		std::map<std::string, Counts> g_counts;
+		std::map<std::string, std::vector<std::pair<std::uint64_t, std::uint64_t>>> g_allow;  // module -> (ID, offset)
 		unsigned                      g_lines = 0;
 		constexpr unsigned            kMaxLines = 4000;
 
@@ -132,7 +133,7 @@ namespace bridge
 			block
 		};
 
-		Kind judge(std::uintptr_t addr, std::size_t n, const std::uint8_t* b, std::size_t have, std::string& where, std::string& note)
+		Kind judge(const std::string& module, std::uintptr_t addr, std::size_t n, const std::uint8_t* b, std::size_t have, std::string& where, std::string& note)
 		{
 			const std::uintptr_t eb = exe_base();
 			const std::uint64_t  rva = addr - eb;
@@ -145,6 +146,17 @@ namespace bridge
 				std::snprintf(buf, sizeof(buf), "SkyrimSE.exe+0x%llX", static_cast<unsigned long long>(rva));
 			}
 			where = buf;
+
+			if (s.found) {
+				if (const auto a = g_allow.find(module); a != g_allow.end()) {
+					for (const auto& [id, off] : a->second) {
+						if (id == s.id && off == s.delta) {
+							note = "allowed by compat\\<plugin>.patches";
+							return Kind::ok;
+						}
+					}
+				}
+			}
 
 			if (!exe_rva_exec(rva)) {
 				// Data. A vtable slot if an RTTI locator precedes a nearby 8-aligned address.
@@ -192,8 +204,6 @@ namespace bridge
 				note = buf;
 				return Kind::ok;
 			}
-			const bool callSite = (n == 5 && have >= 1 && (b[0] == 0xE8 || b[0] == 0xE9)) ||
-			                      (n == 6 && have >= 2 && b[0] == 0xFF && (b[1] == 0x15 || b[1] == 0x25));
 			char spans[96];
 			if (s.then) {
 				std::snprintf(spans, sizeof(spans), "0x%llX in 1.6.1170, 0x%llX now", static_cast<unsigned long long>(s.then),
@@ -201,18 +211,41 @@ namespace bridge
 			} else {
 				std::snprintf(spans, sizeof(spans), "unknown in 1.6.1170, 0x%llX now", static_cast<unsigned long long>(s.now));
 			}
-			if (callSite) {
-				std::snprintf(buf, sizeof(buf), "in-function +0x%llX of a function that changed size (%s), but the %s it replaces is there",
-					static_cast<unsigned long long>(s.delta), spans, n == 5 ? "call/jmp rel32" : "call/jmp [rip+disp]");
+			// The instruction a write of this size normally replaces. Only the first bytes are checked (no disassembler),
+			// so a match is evidence that the site is right, not proof.
+			const char* shape = nullptr;
+			const char* want = nullptr;
+			if (n == 5) {
+				want = "E8/E9 rel32 call/jmp";
+				if (have >= 1 && (b[0] == 0xE8 || b[0] == 0xE9)) {
+					shape = "call/jmp rel32";
+				}
+			} else if (n == 6) {
+				want = "6-byte call/jmp (FF 15/FF 25, FF 90-97) or jcc rel32 (0F 80-8F)";
+				if (have >= 2 && b[0] == 0xFF && (b[1] == 0x15 || b[1] == 0x25)) {
+					shape = "call/jmp [rip+disp32]";
+				} else if (have >= 2 && b[0] == 0xFF && b[1] >= 0x90 && b[1] <= 0x97 && b[1] != 0x94) {
+					shape = "virtual call [reg+disp32]";
+				} else if (have >= 2 && b[0] == 0x0F && b[1] >= 0x80 && b[1] <= 0x8F) {
+					shape = "conditional jump rel32";
+				}
+			} else if (n == 2) {
+				want = "short jump (70-7F, EB)";
+				if (have >= 1 && ((b[0] >= 0x70 && b[0] <= 0x7F) || b[0] == 0xEB)) {
+					shape = "short jump";
+				}
+			}
+			if (shape) {
+				std::snprintf(buf, sizeof(buf), "in-function +0x%llX of a function that changed size (%s), but the %s a %zu-byte patch replaces is there",
+					static_cast<unsigned long long>(s.delta), spans, shape, n);
 				note = buf;
 				return Kind::warn;
 			}
-			if (n == 5 || n == 6) {
+			if (want) {
 				std::snprintf(buf, sizeof(buf),
-					"in-function +0x%llX of a function that changed size (%s). A %zu-byte hook replaces a %s, but the game has %s here: "
+					"in-function +0x%llX of a function that changed size (%s). A %zu-byte patch replaces a %s, but the game has %s here: "
 					"the offset was taken from 1.6.1170 code and misses on this runtime",
-					static_cast<unsigned long long>(s.delta), spans, n, n == 5 ? "E8/E9 rel32 call/jmp" : "FF 15/FF 25 indirect call/jmp",
-					hex(b, std::min<std::size_t>(have, 8)).c_str());
+					static_cast<unsigned long long>(s.delta), spans, n, want, hex(b, std::min<std::size_t>(have, 8)).c_str());
 			} else {
 				std::snprintf(buf, sizeof(buf),
 					"%zu-byte write at in-function +0x%llX of a function that changed size (%s); bytes chosen for 1.6.1170 code, unverifiable here",
@@ -279,7 +312,7 @@ namespace bridge
 			pd.module = module;
 			pd.n = std::min<std::size_t>({ size, sizeof(pd.before), static_cast<std::size_t>(exe_size() - (addr - eb)) });
 			std::memcpy(pd.before, p, pd.n);
-			const Kind k = judge(addr, size, pd.before, pd.n, pd.where, pd.note);
+			const Kind k = judge(module, addr, size, pd.before, pd.n, pd.where, pd.note);
 			auto&      c = g_counts[module];
 			if (k == Kind::block && g_guard) {
 				++c.blocked;
@@ -309,6 +342,13 @@ namespace bridge
 		return allow;
 	}
 
+	void patch_audit_allow(const std::string& module, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& sites)
+	{
+		AcquireSRWLockExclusive(&g_lock);
+		g_allow[module] = sites;
+		ReleaseSRWLockExclusive(&g_lock);
+	}
+
 	void patch_audit_after(void* p, DWORD newProtect, BOOL ok)
 	{
 		if (ok || !writable(newProtect)) {
@@ -325,7 +365,7 @@ namespace bridge
 		ReleaseSRWLockExclusive(&g_lock);
 	}
 
-	void patch_audit_flush(const char* when)
+	void patch_audit_flush(const char* when, const std::string& only)
 	{
 		if (!g_ready) {
 			return;
@@ -340,6 +380,9 @@ namespace bridge
 		}
 		g_pending.clear();
 		for (const auto& [m, c] : g_counts) {
+			if (!only.empty() && m != only) {
+				continue;
+			}
 			logf("[patch] summary %s (%s): %u ok, %u warned, %u blocked, %u left writable", m.c_str(), when, c.ok, c.warned, c.blocked, c.notRestored);
 		}
 		ReleaseSRWLockExclusive(&g_lock);
