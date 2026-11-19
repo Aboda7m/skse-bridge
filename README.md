@@ -95,6 +95,15 @@ own code.
 - **Newer plugins on an older game.** A plugin built for 1.7 on a 1.6 game, or for 1.6.1170 on 1.6.640, has the
   newer structure layouts compiled in. ID translation and the log help; the layouts still need a rebuild.
 
+## What's new in 0.7.0 (experimental)
+
+- **Shadow SkyrimVM.** 1.7 moved members of Skyrim's Papyrus VM object, so plugins built with the other layout
+  get a wrong VM pointer (their Papyrus functions fail or crash, e.g. Cooking Skill Overhaul on 1.6.1170).
+  The bridge detects such plugins, asks once whether to run them with a shadow VM, and redirects every access
+  the plugin makes through its VM singleton to the right place. Works both ways (1.6 plugins on 1.7, 1.7
+  plugins on 1.6). Every redirected access is logged (`[vm-shadow]` lines) so it can be improved from logs.
+- commonlib-shared plugins (libxse) get their Address Library table from the bridge when the shadow is on.
+
 ## What's new in 0.6.0
 
 - One DLL for every supported game version: 1.6.640, 1.6.1170, 1.7.99 and 1.7.104.
@@ -149,6 +158,7 @@ own code.
 | `[Translate] legacy_runtime` | runtime assumed for legacy CommonLibSSE-NG plugins with no declared version (default 1.6.1170) |
 | `[Translate] infer_renumbered` | `1` = also guess renumbered IDs from the Address Libraries (off: some guesses are wrong) |
 | `[Targets] <file>.dll` | runtime that plugin was built for, or `native` |
+| `[VMShadow] enabled`, `ask_on_startup`, `<file>.dll=1/0` | shadow SkyrimVM (experimental); see the ini |
 
 Optional per-plugin files in `Legacy\compat\`: `<plugin>.ids` (ID overrides, one `legacyID = newID` per
 line), `<plugin>.check` (paste the IDs your plugin uses and the log reports each one) and
@@ -170,6 +180,8 @@ Check it first to confirm SKSE loaded SKSE-Bridge and to look for errors. Useful
 - `[patch] ... BLOCKED`: a hook or byte patch the plugin tried to place on game code that changed in 1.7.x.
   The bridge refused it; the feature behind it will not work, but the game stays intact.
 - `[patch] summary`: per plugin, how many writes were fine, warned, or blocked.
+- `SkyrimVM: ... layout 1.7/1.6`: the plugin uses Skyrim's Papyrus VM object, and with which layout.
+- `[vm-shadow] summary`: how many VM accesses were redirected; `UNRESOLVED` lines are what to report.
 
 When reporting a problem, please include:
 

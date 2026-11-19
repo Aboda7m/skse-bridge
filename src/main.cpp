@@ -8,12 +8,13 @@
 
 #include <algorithm>
 #include <map>
+#include <stdexcept>
 
 namespace bridge
 {
 	namespace
 	{
-		constexpr Version kHostVersion{ { 0, 6, 0, 0 } };
+		constexpr Version kHostVersion{ { 0, 7, 0, 0 } };
 
 		struct Config
 		{
@@ -35,6 +36,8 @@ namespace bridge
 			bool                      presentPluginPath{ true };
 			bool                      cosaveMux{ true };
 			bool                      inferRemaps{ false };
+			bool                      vmShadow{ true };      // [VMShadow] enabled: detect and offer the shadow
+			bool                      vmAsk{ true };         // [VMShadow] ask_on_startup
 			std::wstring              ini;
 		};
 
@@ -145,6 +148,8 @@ namespace bridge
 			c.cosaveMux = ini_bool(ini, L"Compatibility", L"cosave_multiplex", true);
 			c.inferRemaps = ini_bool(ini, L"Translate", L"infer_renumbered", false);
 			c.ini = ini;
+			c.vmShadow = ini_bool(ini, L"VMShadow", L"enabled", true);
+			c.vmAsk = ini_bool(ini, L"VMShadow", L"ask_on_startup", true);
 			logf("config: dry_run=%d legacy_dir=%s plugins=%s", c.dryRun ? 1 : 0, narrow(c.legacyDir).c_str(),
 				c.plugins.empty() ? "*" : narrow(list).c_str());
 			logf("config: translate=%d legacy_runtime=%s spoof_skse_runtime=%d id_table=%d force=%d address_library=%s",
@@ -152,7 +157,8 @@ namespace bridge
 				c.addressLibrary.empty() ? "(auto)" : narrow(c.addressLibrary).c_str());
 			logf("config: verify_ids=%d rtti_scan=%d fault_log=%d patch_audit=%d messaging_fanout=%d patch_guard=%d", c.verifyIds ? 1 : 0,
 				c.rttiScan ? 1 : 0, c.faultLog ? 1 : 0, c.patchAudit ? 1 : 0, c.messagingFanout ? 1 : 0, c.patchGuard ? 1 : 0);
-			logf("config: present_plugin_path=%d cosave_multiplex=%d", c.presentPluginPath ? 1 : 0, c.cosaveMux ? 1 : 0);
+			logf("config: present_plugin_path=%d cosave_multiplex=%d vm_shadow=%d ask_on_startup=%d", c.presentPluginPath ? 1 : 0,
+				c.cosaveMux ? 1 : 0, c.vmShadow ? 1 : 0, c.vmAsk ? 1 : 0);
 			return c;
 		}
 
@@ -243,6 +249,155 @@ namespace bridge
 			WriteFile(h, out.data(), static_cast<DWORD>(out.size()), &written, nullptr);
 			CloseHandle(h);
 			logf("  missing-ID list: %s", narrow(path).c_str());
+		}
+
+		// ---- decisions file: Documents\My Games\...\SKSE\SKSE-Bridge.decisions.json ----
+		// Flat JSON object of "key": true|false. Keys: "shadow_vm|<dll>|<sha256 prefix>", "session_open".
+		struct Decisions
+		{
+			std::map<std::string, bool> m;
+			bool                        loaded{ false };
+		};
+		Decisions g_dec;
+		SRWLOCK   g_decLock = SRWLOCK_INIT;
+
+		std::wstring decisions_path() { return log_dir() + L"SKSE-Bridge.decisions.json"; }
+
+		void decisions_load()
+		{
+			if (g_dec.loaded) {
+				return;
+			}
+			g_dec.loaded = true;
+			std::vector<std::uint8_t> raw;
+			std::string               err;
+			if (!read_file(decisions_path(), raw, err)) {
+				return;
+			}
+			const std::string t(raw.begin(), raw.end());
+			std::size_t       p = 0;
+			while ((p = t.find('"', p)) != std::string::npos) {
+				const auto e = t.find('"', p + 1);
+				if (e == std::string::npos) {
+					break;
+				}
+				const std::string key = t.substr(p + 1, e - p - 1);
+				auto              v = t.find_first_not_of(" \t\r\n:", e + 1);
+				if (v != std::string::npos && t.compare(v, 4, "true") == 0) {
+					g_dec.m[key] = true;
+				} else if (v != std::string::npos && t.compare(v, 5, "false") == 0) {
+					g_dec.m[key] = false;
+				}
+				p = e + 1;
+			}
+		}
+
+		void decisions_save()
+		{
+			std::string out = "{\r\n";
+			std::size_t i = 0;
+			for (const auto& [k, v] : g_dec.m) {
+				out += "  \"" + k + "\": " + (v ? "true" : "false") + (++i < g_dec.m.size() ? ",\r\n" : "\r\n");
+			}
+			out += "}\r\n";
+			const HANDLE h = CreateFileW(decisions_path().c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (h != INVALID_HANDLE_VALUE) {
+				DWORD w = 0;
+				WriteFile(h, out.data(), static_cast<DWORD>(out.size()), &w, nullptr);
+				CloseHandle(h);
+			}
+		}
+
+		// Shadow decision for one plugin: [VMShadow] <dll>=0/1, then the decisions file, then a question.
+		bool decide_shadow(const Config& c, const std::wstring& file, const PeReport& rep, bool plugin17, bool game17, bool lastCrashed)
+		{
+			const std::wstring over = ini_string(c.ini, L"VMShadow", file.c_str(), L"");
+			if (!over.empty()) {
+				const bool on = over == L"1" || iequals(over, L"true") || iequals(over, L"yes");
+				logf("  vm-shadow: %s by [VMShadow] %s", on ? "ON" : "off", narrow(file).c_str());
+				return on;
+			}
+			decisions_load();
+			const std::string key = "shadow_vm|" + narrow(file) + "|" + rep.sha256.substr(0, 16);
+			if (const auto it = g_dec.m.find(key); it != g_dec.m.end() && !(lastCrashed && it->second)) {
+				logf("  vm-shadow: %s (saved decision in %s)", it->second ? "ON" : "off", narrow(decisions_path()).c_str());
+				return it->second;
+			}
+			if (!c.vmAsk) {
+				logf("  vm-shadow: off (undecided and ask_on_startup=0)");
+				return false;
+			}
+			std::wstring text = file + L" uses Skyrim's Papyrus VM object (SkyrimVM), which changed in 1.7. This DLL was built for the " +
+			                    std::wstring(plugin17 ? L"1.7" : L"1.6") + L" layout and the game is " + (game17 ? L"1.7" : L"1.6") +
+			                    L". Without help, its Papyrus functions can fail or crash.\n\n";
+			if (lastCrashed) {
+				text += L"Note: the last session with the shadow VM did not reach a loaded game.\n\n";
+			}
+			text += L"Run it with a shadow VM (EXPERIMENTAL)?\n\nYes = use the shadow VM\nNo = load it normally\nCancel = do not load this plugin this session (asked again next launch)\n\n"
+			        L"Your choice is saved in Documents\\My Games\\Skyrim Special Edition\\SKSE\\SKSE-Bridge.decisions.json.";
+			const int r = MessageBoxW(nullptr, text.c_str(), L"SKSE-Bridge", MB_YESNOCANCEL | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND);
+			if (r == IDCANCEL) {
+				logf("  vm-shadow: user chose Cancel: plugin not loaded this session");
+				throw std::runtime_error("cancelled");
+			}
+			const bool on = r == IDYES;
+			AcquireSRWLockExclusive(&g_decLock);
+			g_dec.m[key] = on;
+			decisions_save();
+			ReleaseSRWLockExclusive(&g_decLock);
+			logf("  vm-shadow: %s (asked; saved)", on ? "ON" : "off");
+			return on;
+		}
+
+		HANDLE mapping_from_bytes(const void* data, std::size_t bytes)
+		{
+			const HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, static_cast<DWORD>(static_cast<std::uint64_t>(bytes) >> 32),
+				static_cast<DWORD>(bytes), nullptr);
+			if (!h) {
+				return nullptr;
+			}
+			void* v = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, bytes);
+			if (!v) {
+				CloseHandle(h);
+				return nullptr;
+			}
+			std::memcpy(v, data, bytes);
+			UnmapViewOfFile(v);
+			return h;
+		}
+
+		// commonlib-shared table for the running game, with the SkyrimVM singleton ID pointed at the shadow global.
+		// Format 2: sorted {id, offset} pairs (MAPPING, 16 bytes). Format 5: the file itself (header + u32 offsets).
+		HANDLE shared_table_with_shadow(const Preflight& pf, std::size_t& bytes)
+		{
+			const std::wstring path = game_dir() + L"Data\\SKSE\\Plugins\\versionlib-" + pf.real.wstr(L'-') + L".bin";
+			const Lib&         lib = lib_for(pf.real);
+			const auto         gOff = vm_shadow_global_offset();
+			if (!lib.ok || !gOff) {
+				return nullptr;
+			}
+			if (lib.header.format == 5) {
+				std::vector<std::uint8_t> raw;
+				std::string               err;
+				if (!read_file(path, raw, err) || gOff > 0xFFFFFFFFull) {
+					return nullptr;
+				}
+				const std::size_t at = 96 + 4 * vm_singleton_id();
+				if (at + 4 > raw.size()) {
+					return nullptr;
+				}
+				*reinterpret_cast<std::uint32_t*>(&raw[at]) = static_cast<std::uint32_t>(gOff);
+				bytes = raw.size();
+				return mapping_from_bytes(raw.data(), raw.size());
+			}
+			std::vector<IdEntry> t = lib.entries;
+			for (auto& e : t) {
+				if (e.id == vm_singleton_id()) {
+					e.offset = gOff;
+				}
+			}
+			bytes = t.size() * sizeof(IdEntry);
+			return mapping_from_bytes(t.data(), bytes);
 		}
 
 		struct Plan
@@ -372,6 +527,48 @@ namespace bridge
 				return;
 			}
 
+			// SkyrimVM layout (vmshadow.cpp): static evidence, then the shadow decision.
+			bool shadowVm = false;
+			bool plugin17 = plan.target.at_least(1, 7, 99);
+			if (pf.ok && c.vmShadow) {
+				const VmScan vs = scan_vm_layout(path);
+				if (vs.idRefs) {
+					if (vs.layout) {
+						plugin17 = vs.layout == 17;
+					}
+					std::string sites;
+					for (std::size_t i = 0; i < vs.sites.size() && i < 8; ++i) {
+						char b[24];
+						std::snprintf(b, sizeof(b), " +0x%X", vs.sites[i]);
+						sites += b;
+					}
+					const bool game17 = pf.real.at_least(1, 7, 99);
+					logf("  SkyrimVM: %u reference(s) to the singleton ID; reads at +0x200: %u, +0x210: %u ->%s layout %s (%s)%s", vs.idRefs, vs.votes16,
+						vs.votes17, vs.layout ? "" : " assumed", plugin17 ? "1.7" : "1.6", vs.layout ? "code evidence" : "from target version",
+						sites.c_str());
+					if (plugin17 != game17) {
+						decisions_load();
+						const bool lastCrashed = g_dec.m.count("session_open") && g_dec.m["session_open"];
+						try {
+							shadowVm = decide_shadow(c, file, rep, plugin17, game17, lastCrashed);
+						} catch (const std::exception&) {
+							return;
+						}
+						if (shadowVm && !vm_shadow_init(pf.real, pf.entries)) {
+							shadowVm = false;
+						}
+						if (shadowVm) {
+							AcquireSRWLockExclusive(&g_decLock);
+							g_dec.m["session_open"] = true;
+							decisions_save();
+							ReleaseSRWLockExclusive(&g_decLock);
+						}
+					} else {
+						logf("  SkyrimVM: same layout as the game; no shadow needed");
+					}
+				}
+			}
+
 			InterposeConfig ic;
 			ic.spoofVersion = false;  // set below when translated
 			ic.realPath = path;
@@ -412,7 +609,15 @@ namespace bridge
 					logf("  remaps: %u known, %u inferred (infer_renumbered=%d), %zu global, %zu from %s", known, inferred, c.inferRemaps ? 1 : 0,
 						pf.globalRules.size(), own.size(), hasOverlay ? narrow(overlay).c_str() : "no overlay");
 					TableStats st;
-					const auto table = build_legacy_table(targetLib->entries, pf.entries, rules, st);
+					auto       table = build_legacy_table(targetLib->entries, pf.entries, rules, st);
+					if (shadowVm) {
+						for (auto& e : table) {
+							if (e.id == vm_singleton_id()) {
+								e.offset = vm_shadow_global_offset();
+								logf("  vm-shadow: ID %llu in this plugin's table -> shadow global", static_cast<unsigned long long>(e.id));
+							}
+						}
+					}
 					logf("  table: %zu rows, %zu translated, %zu missing (poisoned), %zu remap rule(s) applied", st.rows, st.translated,
 						st.missing, st.overlaid);
 					write_missing_report(plan.target, *targetLib, pf);
@@ -451,6 +656,17 @@ namespace bridge
 				}
 			}
 
+			if (shadowVm && !plan.translate) {
+				if (rep.strIddbShared) {
+					ic.sharedMapping = shared_table_with_shadow(pf, ic.sharedBytes);
+					logf("  vm-shadow: commonlib-shared table for %s %s", pf.real.str('.').c_str(), ic.sharedMapping ? "prepared" : "FAILED (shadow off)");
+				}
+				if (!ic.sharedMapping) {
+					logf("  vm-shadow: the bridge does not answer this plugin's Address Library loader; shadow not possible");
+					shadowVm = false;
+				}
+			}
+
 			// The interposer is installed for every hosted DLL (path, patch audit); version spoof and ID table only when translated.
 			early_arm(path, file, ic, true, c.faultLog);
 			logf("  loading (DllMain and static initializers run now)");
@@ -470,6 +686,9 @@ namespace bridge
 				if (c.faultLog) {
 					fault_log_add_module(mod, narrow(file));
 				}
+			}
+			if (shadowVm) {
+				vm_shadow_add_module(mod, narrow(file), plugin17);
 			}
 			if (c.rttiScan) {
 				scan_rtti(mod, narrow(file), direction);
@@ -515,6 +734,19 @@ namespace bridge
 				patch_audit_flush("after SKSEPlugin_Load", narrow(file));
 			}
 		}
+	}
+}
+
+namespace bridge
+{
+	void vm_session_reached_game()
+	{
+		AcquireSRWLockExclusive(&g_decLock);
+		if (g_dec.m.count("session_open") && g_dec.m["session_open"]) {
+			g_dec.m["session_open"] = false;
+			decisions_save();
+		}
+		ReleaseSRWLockExclusive(&g_decLock);
 	}
 }
 

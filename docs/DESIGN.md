@@ -439,3 +439,51 @@ Libraries in the real formats) × three plugins (default NG, `[Targets]=1.6.640`
 | 1.6.640 | translated 1170 -> 640, 443410 -> 69188 (inverted), 1.7-only ID poisoned | native | native |
 
 0.5.0 harnesses (patch guard, co-save, module path, OldPlugin) unchanged. Builds; needs in-game verification.
+
+
+## Stage 11 — 0.7.0 (EXPERIMENTAL): shadow SkyrimVM (2026-11-19)
+
+**Rule exception, granted by the user for this feature only:** the original out-of-scope list includes
+struct-layout proxies. The user asked for VM emulation explicitly ("build an experimental 0.7.0 with fixes and
+logging for vm"). It is limited to SkyrimVM, opt-in per plugin (asked on startup, saved), and logs every access.
+
+**Change** [Verified]: 1.7.99 inserted two event sinks (amiibo) at SkyrimVM+0x180; allocation 0x8978 -> 0x8988
+(`mov edx, imm` in both real exes); CommonLibSSE-NG 16.9.0 `SkyrimVM.h` shifts every member from 0x180 by 0x10.
+`BSScript::Internal::VirtualMachine`, `Stack`, `StackFrame`, `CodeTasklet`, `IFunction`, `NativeFunction`: no
+1.7.99 variants in NG.
+
+**Evidence from real crashes**: Cooking Skill Overhaul (FreeCooking.dll, commonlib-shared, built for 1.7) on
+1.6.1170: `mov rcx,[rcx+0x210]` reads `debugInterface`; `call [rax+0xB0]` jumps through a 2-slot vtable of the
+VM's debug-interface sub-object into string bytes ("t number"), CrashLogger's non-canonical read [Verified,
+disassembly + 1.6.1170 RTTI].
+
+**Detection** (`scan_vm_layout`): the singleton ID 400475 as an immediate in code, followed within 256 bytes by
+`mov r64,[r64+0x200]` (1.6) or `[r64+0x210]` (1.7). FreeCooking: 2 references, both +0x210, at exactly the two
+known sites (+0xF8167, +0x121A48). No code evidence -> layout of the plugin's target version.
+
+**Mechanism** (`src/vmshadow.cpp`): the ID that the plugin's table gives for 400475 points at a guarded global G
+next to the game image (u32-safe for format-5 tables). Reading G yields the shadow pointer S once the game's own
+global is non-null (null before, like the real one). S is never readable: each access faults; the vectored handler
+maps the plugin-layout offset to this runtime's offset, moves the instruction's base register by the difference,
+single-steps the plugin's own instruction against the real object and restores the register unless the
+instruction wrote it. Atomic and string instructions run natively. The 1.7-only sinks map to a zero page for 1.6
+games. Table control: legacy NG via the translated table; commonlib-shared via `OpenFileMappingA
+("COMMONLIB_IDDB_OFFSETS_<ver>")`, which that library opens before creating and then uses as-is
+(commonlib-shared `include/REX/FMemoryMap.h:106`, `src/REL/IDDB.cpp` load_v2/load_v5) [Verified, HEAD source].
+
+**Decision**: `[VMShadow] <dll>=1/0`, else `SKSE-Bridge.decisions.json` (key = file + SHA-256 prefix), else a
+Yes/No/Cancel question before the plugin loads. `session_open` is set while a shadowed session has not reached a
+loaded game; if still set on the next launch, saved "yes" answers are asked again.
+
+**Not covered**: a `SkyrimVM*` the game passes into a plugin hook; pointer comparisons between S and the real
+object; game code that receives S (mapped with the last plugin layout on that thread, logged as `<game code>`);
+instruction forms the decoder does not resolve (logged UNRESOLVED, left to fault). PlayerCharacter is not
+shadowed (hot object, pointer identity everywhere) — Rain Extinguishes Fires' 1.7 event-source offset stays
+"use the author's 1.6 (GOG option) build".
+
+**Harness** (Wine, both directions, synthetic object where every qword holds its own offset):
+1.7-layout commonlib-shared mock on a 1.6.1170 game: singleton null during load, impl +0x210 -> real +0x200,
++0x100 unchanged, +0x180 -> zero, write +0x690 -> real +0x680, `lock cmpxchg` +0x688 -> real +0x678, `rep movsb`
+from +0x300 -> real +0x2F0, `movups` +0x220 -> real +0x210; real +0x688/+0x690 untouched. 1.6-layout legacy NG
+mock on a 1.7.99 game: +0x200 -> real +0x210, write +0x680 -> real +0x690. 0 unresolved. All earlier harnesses
+unchanged. Builds; needs in-game verification.

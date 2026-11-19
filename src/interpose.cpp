@@ -364,6 +364,22 @@ namespace bridge
 			return ::OpenFileMappingW(access, inherit, name);
 		}
 
+		// commonlib-shared (libxse) REL::IDDB: FMemoryMap::create_impl opens "COMMONLIB_IDDB_OFFSETS_<version>" before
+		// creating it and, when it exists, uses its contents without unpacking (commonlib-shared include/REX/FMemoryMap.h:106).
+		HANDLE WINAPI Hook_OpenFileMappingA(DWORD access, BOOL inherit, LPCSTR name)
+		{
+			const void* const caller = BRIDGE_RETURN_ADDRESS();
+			ModuleCtx         ctx;
+			if (name && std::string_view(name).starts_with("COMMONLIB_IDDB_OFFSETS_") && find_ctx(caller, ctx) && ctx.cfg.sharedMapping) {
+				HANDLE dup = nullptr;
+				if (DuplicateHandle(GetCurrentProcess(), ctx.cfg.sharedMapping, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+					logf("[interpose] %s: OpenFileMappingA(\"%s\") -> bridge table (%zu bytes)", ctx.name.c_str(), name, ctx.cfg.sharedBytes);
+					return dup;
+				}
+			}
+			return ::OpenFileMappingA(access, inherit, name);
+		}
+
 		HANDLE WINAPI Hook_CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect, DWORD hi, DWORD lo, LPCWSTR name)
 		{
 			const void* const caller = BRIDGE_RETURN_ADDRESS();
@@ -493,6 +509,9 @@ namespace bridge
 		if (cfg.idTable) {
 			r.openFileMappingW = patch_iat(legacy, "OpenFileMappingW", reinterpret_cast<void*>(&Hook_OpenFileMappingW));
 			r.createFileMappingW = patch_iat(legacy, "CreateFileMappingW", reinterpret_cast<void*>(&Hook_CreateFileMappingW));
+		}
+		if (cfg.sharedMapping) {
+			r.openFileMappingA = patch_iat(legacy, "OpenFileMappingA", reinterpret_cast<void*>(&Hook_OpenFileMappingA));
 		}
 		if (!cfg.presentPath.empty()) {
 			const std::pair<const char*, void*> pathHooks[] = {

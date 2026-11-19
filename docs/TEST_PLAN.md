@@ -107,3 +107,13 @@ Same SKSE-Bridge.dll on each game version you have (1.6.640, 1.6.1170, 1.7.x):
 2. A plugin built for the running game must say `loaded natively` and behave exactly as without the bridge.
 3. A 1.6.1170 plugin on 1.7.x: as in 0.5.0.
 4. A 1.6.640 plugin: put it in `Legacy\`; if its line does not say 1.6.640, add `[Targets] Name.dll=1.6.640`.
+
+
+## 0.7.0 shadow VM in game
+
+1. Cooking Skill Overhaul on 1.6.1170: answer Yes to the question. Log: `SkyrimVM: ... layout 1.7 (code
+   evidence) +0xF8167 +0x121A48`, `OpenFileMappingA("COMMONLIB_IDDB_OFFSETS_1_6_1170_0") -> bridge table`,
+   `[vm-shadow] FreeCooking.dll reads SkyrimVM+0x210 ... -> real +0x200`. The cooking UI should open without
+   the crash at FreeCooking.dll+0xF819D.
+2. Send `SKSE-Bridge.log` with every `[vm-shadow]` line, especially `UNRESOLVED` and `<game code>`.
+3. Answer No on a second launch (edit the decisions file): the old crash must come back (negative control).

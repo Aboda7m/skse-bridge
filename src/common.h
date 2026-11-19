@@ -266,6 +266,8 @@ namespace bridge
 		std::size_t mappingBytes{ 0 };
 		bool    patchAudit{ false };  // watch VirtualProtect calls on SkyrimSE.exe (patchaudit.cpp)
 		bool    idTable{ false };     // answer CommonLibSSEOffsets-v2-* with `mapping` (legacy NG lineage, translated)
+		HANDLE  sharedMapping{ nullptr };  // answer for commonlib-shared's COMMONLIB_IDDB_OFFSETS_* (OpenFileMappingA)
+		std::size_t sharedBytes{ 0 };
 		std::wstring realPath;         // the DLL's actual path (Legacy\<file>)
 		std::wstring presentPath;      // path GetModuleFileName reports for it; empty = real path
 	};
@@ -279,7 +281,8 @@ namespace bridge
 		int openFileMappingW{ 0 };
 		int createFileMappingW{ 0 };
 		int virtualProtect{ 0 };
-		int modulePath{ 0 };  // GetModuleFileName + path-taking functions that map the presented path back
+		int modulePath{ 0 };
+		int openFileMappingA{ 0 };  // GetModuleFileName + path-taking functions that map the presented path back
 	};
 
 	InterposeResult install_interposer(HMODULE legacy, const std::wstring& name, const InterposeConfig& cfg);
@@ -296,6 +299,23 @@ namespace bridge
 	// compat\<plugin>.patches: "allow <ID>+0x<offset>" lines; such writes are never blocked.
 	void patch_audit_allow(const std::string& module, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& sites);
 	void patch_audit_flush(const char* when, const std::string& onlyModule = {});  // logs writes whose protection was never restored, and a summary
+
+	// ---- vmshadow.cpp : EXPERIMENTAL shadow SkyrimVM (layout translation for the 1.7.99 SkyrimVM change) ----
+	struct VmScan
+	{
+		unsigned                   idRefs{ 0 };   // immediates 400475 (SkyrimVM singleton ID) in code
+		unsigned                   votes16{ 0 };  // ... followed by mov r64,[r64+0x200]
+		unsigned                   votes17{ 0 };  // ... followed by mov r64,[r64+0x210]
+		int                        layout{ 0 };   // 16, 17 or 0 (no evidence)
+		std::vector<std::uint32_t> sites;         // RVAs of those reads
+	};
+	VmScan        scan_vm_layout(const std::wstring& path);
+	bool          vm_shadow_init(const Version& game, const std::vector<IdEntry>& gameLib);
+	std::uint64_t vm_shadow_global_offset();  // what the plugin's table gives for the singleton ID
+	std::uint64_t vm_singleton_id();
+	void          vm_shadow_add_module(HMODULE mod, const std::string& name, bool layout17);
+	void          vm_shadow_report(const char* when);
+	void          vm_session_reached_game();  // main.cpp: clears the crash marker of the decisions file
 
 	// ---- earlyload.cpp : patch a legacy module before its DllMain / static initializers run ----
 	struct EarlyResult
