@@ -22,7 +22,7 @@ and improve the approach.
 
 ## Requirements
 
-- Skyrim Special Edition **1.7.99** or **1.7.104**
+- Skyrim Special Edition **1.6.640**, **1.6.1170**, **1.7.99** or **1.7.104** (the same DLL for all)
 - SKSE matching your installed runtime
 - Address Library for SKSE Plugins: **All in One (1.7.104.0) v13**
 
@@ -89,8 +89,20 @@ own code.
   sub-space in it, so several hosted plugins can save. Co-save data a hosted plugin wrote with 0.4.0 or
   earlier (or with `cosave_multiplex=0`) was stored under that plugin's own ID and is not read by the new
   layout; expect that plugin to start fresh once.
-- **Supported lineage.** Only plugins built with the CommonLibSSE-NG lineage are understood. Others are
-  skipped unless `force=1` is set.
+- **Supported lineage.** Translation works for plugins whose Address Library loader the bridge can answer
+  (legacy CommonLibSSE-NG). Others (commonlib-shared/libxse, Ryan's CommonLibSSE) are loaded natively: they find
+  their own library for the running game, and their compiled-in structure layouts must match it.
+- **Newer plugins on an older game.** A plugin built for 1.7 on a 1.6 game, or for 1.6.1170 on 1.6.640, has the
+  newer structure layouts compiled in. ID translation and the log help; the layouts still need a rebuild.
+
+## What's new in 0.6.0
+
+- One DLL for every supported game version: 1.6.640, 1.6.1170, 1.7.99 and 1.7.104.
+- Each DLL in `Legacy\` is loaded for the runtime it was built for: plugins built for the running game load
+  natively; older or newer ones are translated (1.6.640 or 1.6.1170 plugins on a 1.7 game, 1.6.1170 plugins on
+  1.6.640, 1.6.640 plugins on 1.6.1170). The log line `target:` says which.
+- Override per plugin in `[Targets]` of `LegacyHost.ini` (`SomePlugin.dll=1.6.640` or `=native`).
+- Verified renumbered functions are remapped in both directions (1.6.1130 and 1.7.99 updates).
 
 ## What's new in 0.5.0
 
@@ -134,6 +146,9 @@ own code.
 | `[Compatibility] patch_guard` | `1` = refuse writes that would land on the wrong game code (default); `0` = log only |
 | `[Compatibility] present_plugin_path` | `1` = hosted DLLs see themselves in `Data\SKSE\Plugins\` (default) |
 | `[Compatibility] cosave_multiplex` | `1` = one co-save sub-space per hosted plugin (default) |
+| `[Translate] legacy_runtime` | runtime assumed for legacy CommonLibSSE-NG plugins with no declared version (default 1.6.1170) |
+| `[Translate] infer_renumbered` | `1` = also guess renumbered IDs from the Address Libraries (off: some guesses are wrong) |
+| `[Targets] <file>.dll` | runtime that plugin was built for, or `native` |
 
 Optional per-plugin files in `Legacy\compat\`: `<plugin>.ids` (ID overrides, one `legacyID = newID` per
 line), `<plugin>.check` (paste the IDs your plugin uses and the log reports each one) and

@@ -184,7 +184,7 @@ namespace bridge
 		return true;
 	}
 
-	int scan_rtti(HMODULE mod, const std::string& modName)
+	int scan_rtti(HMODULE mod, const std::string& modName, int direction)
 	{
 		Image img;
 		img.base = reinterpret_cast<std::uintptr_t>(mod);
@@ -256,10 +256,20 @@ namespace bridge
 							break;
 						}
 					}
+					if (direction == 0) {
+						continue;  // plugin and game on the same side of 1.7.99
+					}
 					++affected;
-					logf("  RTTI: INCOMPATIBLE VTABLE: plugin class %s derives from %s, whose vtable gained %u slot(s) at index %u in 1.7.99. "
-						 "Its vtable (%s+0x%llX, %u slots) is laid out for 1.6. %s. The game will call the wrong functions of this class.",
-						pretty(cls).c_str(), ch.cls, ch.added, ch.insertAt, modName.c_str(), static_cast<unsigned long long>(vtRva), slots, ch.effect);
+					if (direction > 0) {
+						logf("  RTTI: INCOMPATIBLE VTABLE: plugin class %s derives from %s, whose vtable gained %u slot(s) at index %u in 1.7.99. "
+							 "Its vtable (%s+0x%llX, %u slots) is laid out for 1.6. %s. The game will call the wrong functions of this class.",
+							pretty(cls).c_str(), ch.cls, ch.added, ch.insertAt, modName.c_str(), static_cast<unsigned long long>(vtRva), slots, ch.effect);
+					} else {
+						logf("  RTTI: INCOMPATIBLE VTABLE: plugin class %s derives from %s. The plugin was built for 1.7.99+, where that vtable "
+							 "has %u more slot(s) from index %u; this game does not. Its vtable (%s+0x%llX, %u slots) is laid out for 1.7: "
+							 "from index %u on the game calls the wrong functions of this class.",
+							pretty(cls).c_str(), ch.cls, ch.added, ch.insertAt, modName.c_str(), static_cast<unsigned long long>(vtRva), slots, ch.insertAt);
+					}
 				}
 			}
 		}

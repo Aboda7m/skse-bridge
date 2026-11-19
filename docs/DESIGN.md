@@ -348,3 +348,94 @@ rejects it if that lies in 0x1F008600..0x68338EFF (1986-06-26 .. 2025-05-25 UTC)
 content hash there, so whether a build passed was luck (the 0.5.0 hash decoded to 2008). Fix: the host declares
 Ex bit 1 (`kVersionIndependentEx_AddressLibraryV5`, our name); it does read the 1.7.x format-5 library itself.
 Hosted legacy DLLs are never checked by SKSE, so this does not apply to them.
+
+
+### 1.6.1170 binaries (example-sources/1.6.1170) — checks [Verified, read-only disassembly]
+- **SKSE 2.2.6 (`skse64_1_6_1170.dll`) accepts SKSE-Bridge.** Its compatibility check (RVA 0x81FE0-0x82124):
+  rejects only `versionIndependence & ~7`, missing Address Library file (call 0x819B0), AL/Signatures without
+  StructsPost629 or Ex NoStructUse, no listed runtime when not version independent, `xseMinimum > 2.2.6`.
+  It has no TimeDateStamp test and ignores Ex bit 1. The bridge (Ind 0x5, Ex 0x3, xseMinimum 0) passes both
+  2.2.6 and 2.3.1, so one DLL can serve both runtimes.
+- **Improved Camera sites, 1.6.1170 vs 1.7.104:**
+
+  | site | 1.6.1170 at IC's offset | same instruction in 1.7.104 |
+  |---|---|---|
+  | TESObjectCell_Get3D 19165+0x7B | `call [rax+0x468]` (FF 90), exact | at +0x7A (moved -1) |
+  | SmoothAnimationTransitions 41996+0x2F4 | `call [rax+0x388]` (FF 90), exact | at +0x303 (moved +0xF) |
+  | HorseLookingDownFix1 37356+0xB64 | `ja short` (77 10) | same offset |
+
+  Confirms the guard's blocks and the horse false positive. Relocating hooks to the new offsets is not done
+  (instruction matching = signature scanning, out of scope); a rebuilt IC would use +0x7A / +0x303.
+
+
+### 1.6.640 inputs (example-sources/1.6.640) — findings for 0.6.0 [2026-11-19]
+- **Address Library**: `versionlib-1-6-640-0.bin` ships in the user's AIO package (format 2, 416,334 IDs, max 434,106)
+  [Verified]. The bridge can read it; nothing needs to be shipped.
+- **Numbering vs 1.6.1170** [Verified, AL only]: 361,819 IDs in both; on those, 99.1% of spans are identical and
+  offsets keep their order (1,014 inversions), so the numbering is the same scheme. 54,515 IDs exist only in 640;
+  66,642 only in 1170 (all >= 400,000).
+- **Renumbered functions 640 -> 1170** [Assumption, measured]: predicting an ID's 1170 offset from the nearest
+  common ID below it ("anchor") is exact for 98.65% of 20,000 held-out common IDs. Applied to 640-only IDs:
+  17,204 land exactly on a 1170-only ID (renumbered), 1,213 on a common ID (ambiguous, not used), 36,098 on
+  nothing (gone). Checked against the three 1130 renumberings CommonLib-NG names (`AE_CHECK(1130, ...)`): 2 agree
+  (21890->441582, 69188->443410), 0 disagree, 1 not found (405935->504099, data). Such a table must be computed at
+  runtime from the user's installed files, never shipped (rule 3).
+- **Layouts 640 -> 1130+** [Verified, NG 539d4ce source]: `ControlMap` runtime data 0xE8 -> 0xF0,
+  `Renderer` depth-stencil/RendererData2/lock +0x60, `TES` runtime data replaced (0x128 -> AE block at 0x120,
+  RUNTIME_DATA2 0x140 -> 0x148), `BGSSaveLoadManager` runtime data 0x2B0 -> 0x2F8. A 640-built plugin that touches
+  these reads wrong fields on 1170 and on 1.7.x (where the 1.7.99 changes come on top).
+- **SKSE 2.2.3 (`src/skse64/PluginManager.cpp`)** accepts the bridge (same rules as 2.2.6; no timestamp test)
+  [Verified, source]. This also confirms the reading of the 2.2.6 disassembly.
+- **1.6.640 SkyrimSE.exe is SteamStub-encrypted** (`.bind` section, `.text` entropy 8.00) [Verified]: no static
+  code comparison is possible from it; it is not unpacked (DRM). The GOG build 1.6.659 is the same game
+  generation without DRM, and the AIO package already has `versionlib-1-6-659-0.bin`.
+
+
+## Stage 10 — 0.6.0: one DLL, every supported runtime, per-plugin target (2026-11-19)
+
+**Per plugin** (`plan_for` in `src/main.cpp`), the runtime it was built for (target) is taken from, in order:
+1. `[Targets] <file>=<version>|native` in LegacyHost.ini;
+2. the version list in its `SKSEPlugin_Version` (non-independent plugins): the game itself if listed (native),
+   else the first entry;
+3. legacy CommonLibSSE-NG lineage (imports GetFileVersionInfoW/VerQueryValueW/OpenFileMappingW, not
+   commonlib-shared): `legacy_runtime` (default 1.6.1170) — this lineage reads its runtime from the exe, so the
+   DLL itself does not say which it was built against;
+4. anything else: native (it loads the library for the running game itself; commonlib-shared also validates
+   the file, so it must never be handed another one).
+Target == game → native: no spoof, no ID table, interposer only for module path and patch audit.
+Target != game and translatable → spoof the target, table = target library rows with offsets from the game's
+library. Works in any direction between 1.6.x and 1.7.x because the numbering is shared (1.6.640 vs 1.6.1170:
+99.1% identical spans; 1.6.1170 vs 1.7.x: 97.6%).
+
+**Address Libraries** are loaded per version on demand (`lib_for`), from the user's installation only.
+`SKSE-Bridge-missing-ids-<target>.txt` per target.
+
+**Renumbered functions** (`known_remaps`): verified pairs per game update, applied forward (plugin before the
+update, game after) or inverted (the reverse): 1.6.1130 (NG 539d4ce AE_CHECK: 21890->441582, 69188->443410,
+405935->504099) and 1.7.99 (NG 9955ae3: 4 pairs). Inference from the two libraries (`infer_remaps`) exists but
+is **off by default**: it reproduces all 4 verified 1.7.99 pairs, but against both real executables
+(1.6.1170 and 1.7.104, unencrypted) only 64.6% of 4,176 code-checkable inferred pairs begin with the same code
+(unchanged IDs: 99.1%; random pairs: 1.4%) and 14.5% look unrelated. A wrong remap calls the wrong function
+silently; a missing ID faults at a named address. [Measured]
+
+**Direction-aware diagnostics**: vtable checks (`vtable_direction`) apply when plugin and game lie on opposite
+sides of 1.7.99, mirrored for the reverse (plugin built for 1.7 on 1.6). Patch audit compares each module
+against its own target library. 1.6.1130 layout changes (ControlMap, Renderer, TES, BGSSaveLoadManager) are
+documented (Stage 9 notes) but not detected automatically.
+
+**Version spoof is per module** (stable strings per version), so 1.6.640 and 1.6.1170 plugins can be spoofed
+differently in the same session.
+
+**SKSE acceptance** of the one DLL [Verified]: 2.2.3 (source), 2.2.6 and 2.3.1 (disassembly) with
+Ind 0x5, Ex 0x3, xseMinimum 0.
+
+**Harness** (Wine): three mock games (1.7.99, 1.6.1170, 1.6.640, version resource + synthetic Address
+Libraries in the real formats) × three plugins (default NG, `[Targets]=1.6.640`, declares 1.6.640):
+
+| game | default NG (1.6.1170) | [Targets] 1.6.640 | declares 1.6.640 |
+|---|---|---|---|
+| 1.7.99 | translated | translated, 69188 -> 443410 (known 1130) | translated |
+| 1.6.1170 | native | translated 640 -> 1170 | translated |
+| 1.6.640 | translated 1170 -> 640, 443410 -> 69188 (inverted), 1.7-only ID poisoned | native | native |
+
+0.5.0 harnesses (patch guard, co-save, module path, OldPlugin) unchanged. Builds; needs in-game verification.

@@ -82,6 +82,10 @@ namespace bridge
 			       (std::uint32_t(v[2] & 0xFFF) << 4) | std::uint32_t(v[3] & 0x00F);
 		}
 		[[nodiscard]] bool operator==(const Version& o) const noexcept { return std::memcmp(v, o.v, sizeof(v)) == 0; }
+		[[nodiscard]] bool at_least(std::uint16_t a, std::uint16_t b, std::uint16_t cc) const noexcept
+		{
+			return !less(Version{ { a, b, cc, 0 } });
+		}
 		[[nodiscard]] bool less(const Version& o) const noexcept
 		{
 			for (int i = 0; i < 4; ++i) {
@@ -139,6 +143,7 @@ namespace bridge
 		bool                     strVersionlib{ false };  // "versionlib-"
 		bool                     strVersionSE{ false };   // "Plugins/version-"
 		bool                     strSkseRuntime{ false }; // "SKSE_RUNTIME"
+		bool                     strIddbShared{ false };  // "COMMONLIB_IDDB_OFFSETS_" (commonlib-shared / libxse)
 
 		[[nodiscard]] bool        imports_fn(std::string_view fn) const;
 		[[nodiscard]] const char* lineage() const;  // "A", "B" or "unknown"
@@ -194,9 +199,18 @@ namespace bridge
 
 	using RemapRules = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
 
-	// Functions that 1.7.99 renumbered (old ID absent from the 1.7.99 library, same function under a new ID).
-	// Empty unless legacy is 1.6.x and the game is 1.7.99 or later.
-	RemapRules known_remaps(const Version& legacy, const Version& game);
+	// Functions a game update renumbered (old ID absent afterwards, same function under a new ID), from
+	// CommonLibSSE-NG AE_CHECK call sites. Applied forward (plugin built before the update, game after it) or
+	// inverted (plugin built after, game before). Empty when the update lies outside [plugin, game].
+	RemapRules known_remaps(const Version& plugin, const Version& game);
+
+	// Renumbered IDs inferred from two Address Libraries: for an ID of `plugin` that `game` lacks, its game offset
+	// is predicted from the nearest ID both contain; if an ID that only `game` has sits exactly there, it is taken
+	// as the same function. Off by default ([Translate] infer_renumbered): it reproduces all four NG-verified
+	// 1.7.99 renumberings, but on 1.6.1170 -> 1.7.104 only 64.6% of 4,176 code-checkable inferred pairs start with the same
+	// code (99.1% for unchanged IDs) and 14.5% look unrelated. A wrong remap calls the wrong function; a missing ID faults
+	// visibly. [Measured 2026-11-19 against both real executables]
+	RemapRules infer_remaps(const std::vector<IdEntry>& plugin, const std::vector<IdEntry>& game);
 
 	// ---- verify.cpp : checks resolved offsets against the running SkyrimSE.exe image ----
 	void verify_table(const std::vector<IdEntry>& table);
@@ -210,7 +224,13 @@ namespace bridge
 	// ---- rtti.cpp : read-only RTTI scan of a loaded legacy module ----
 	// Reports plugin classes that derive from game interfaces whose vtable changed in 1.7.99.
 	// Returns the number of affected classes.
-	int scan_rtti(HMODULE mod, const std::string& name);
+	// direction: +1 plugin built before 1.7.99 on a game from 1.7.99 on; -1 the reverse; 0 neither (nothing to report).
+	int scan_rtti(HMODULE mod, const std::string& name, int direction);
+	inline int vtable_direction(const Version& plugin, const Version& game)
+	{
+		const bool p = plugin.at_least(1, 7, 99), g = game.at_least(1, 7, 99);
+		return p == g ? 0 : (g ? 1 : -1);
+	}
 
 	struct GameVtableInfo
 	{
@@ -245,6 +265,7 @@ namespace bridge
 		HANDLE  mapping{ nullptr };  // private table, may be null
 		std::size_t mappingBytes{ 0 };
 		bool    patchAudit{ false };  // watch VirtualProtect calls on SkyrimSE.exe (patchaudit.cpp)
+		bool    idTable{ false };     // answer CommonLibSSEOffsets-v2-* with `mapping` (legacy NG lineage, translated)
 		std::wstring realPath;         // the DLL's actual path (Legacy\<file>)
 		std::wstring presentPath;      // path GetModuleFileName reports for it; empty = real path
 	};
@@ -266,7 +287,9 @@ namespace bridge
 
 	// ---- patchaudit.cpp : what hosted plugins write into SkyrimSE.exe, and the patch guard ----
 	// legacy/current: Address Libraries sorted by ID. guard: refuse writes judged to land on the wrong code.
-	void patch_audit_init(const std::vector<IdEntry>& legacy, const std::vector<IdEntry>& current, bool guard);
+	void patch_audit_init(const std::vector<IdEntry>& current, bool guard);
+	// The Address Library the module was built against (sorted by ID) and the vtable direction (see vtable_direction).
+	void patch_audit_target(const std::string& module, const Version& target, const std::vector<IdEntry>& plugin, int direction);
 	// Called from the VirtualProtect interposer. Returns false if the call must be refused.
 	bool patch_audit_protect(const std::string& module, void* addr, std::size_t size, DWORD newProtect);
 	void patch_audit_after(void* addr, DWORD newProtect, BOOL ok);

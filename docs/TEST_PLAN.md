@@ -98,3 +98,12 @@ Done (Wine, synthetic): see DESIGN Stage 8 "Harness". In game, with Improved Cam
 3. Remove one of them, load and save, put it back, load: its data must come back (`kept ... record(s)` lines).
 4. Presented path: a plugin with an ini next to `Data\SKSE\Plugins\`: its settings take effect; the log line
    `module path presented to the plugin` names that path.
+
+
+## 0.6.0 in game
+
+Same SKSE-Bridge.dll on each game version you have (1.6.640, 1.6.1170, 1.7.x):
+1. `target:` line per plugin: built-for version, game version, TRANSLATED or loaded natively, and why.
+2. A plugin built for the running game must say `loaded natively` and behave exactly as without the bridge.
+3. A 1.6.1170 plugin on 1.7.x: as in 0.5.0.
+4. A 1.6.640 plugin: put it in `Legacy\`; if its line does not say 1.6.640, add `[Targets] Name.dll=1.6.640`.

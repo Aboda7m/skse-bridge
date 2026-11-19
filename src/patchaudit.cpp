@@ -29,6 +29,7 @@
 #include "common.h"
 
 #include <algorithm>
+#include <deque>
 #include <map>
 
 namespace bridge
@@ -60,9 +61,21 @@ namespace bridge
 		SRWLOCK                       g_lock = SRWLOCK_INIT;
 		bool                          g_ready = false;
 		bool                          g_guard = false;
-		std::vector<Off>              g_cur;   // IDs present in both libraries, by current offset
-		std::vector<IdEntry>          g_leg;   // legacy library, by ID
-		std::vector<std::uint64_t>    g_legCommon;  // legacy offsets of the same IDs, sorted
+		struct Target
+		{
+			Version                    version{};
+			std::vector<Off>           cur;        // IDs present in both libraries, by current offset
+			std::vector<IdEntry>       leg;        // the plugin's library, by ID
+			std::vector<std::uint64_t> legCommon;  // its offsets of the same IDs, sorted
+		};
+		struct ModTarget
+		{
+			const Target* target{ nullptr };
+			int           direction{ 0 };
+		};
+		std::vector<IdEntry>                g_current;  // the game's library, by ID
+		std::deque<Target>                  g_targets;  // one per plugin target version (stable addresses)
+		std::map<std::string, ModTarget>    g_modTarget;
 		std::vector<Pending>          g_pending;
 		std::map<std::string, Counts> g_counts;
 		std::map<std::string, std::vector<std::pair<std::uint64_t, std::uint64_t>>> g_allow;  // module -> (ID, offset)
@@ -103,9 +116,12 @@ namespace bridge
 		};
 
 		// Nearest ID at or below `rva` that exists in both libraries, and its span in each.
-		Span span_of(std::uint64_t rva)
+		Span span_of(const Target& t, std::uint64_t rva)
 		{
 			Span s;
+			const auto& g_cur = t.cur;
+			const auto& g_leg = t.leg;
+			const auto& g_legCommon = t.legCommon;
 			auto it = std::upper_bound(g_cur.begin(), g_cur.end(), Off{ rva, ~0ull });
 			if (it == g_cur.begin()) {
 				return s;
@@ -138,7 +154,10 @@ namespace bridge
 			const std::uintptr_t eb = exe_base();
 			const std::uint64_t  rva = addr - eb;
 			char                 buf[512];
-			const Span          s = span_of(rva);
+			const auto           mt = g_modTarget.find(module);
+			const Target*        tg = mt != g_modTarget.end() ? mt->second.target : nullptr;
+			const int            dir = mt != g_modTarget.end() ? mt->second.direction : 0;
+			const Span           s = tg ? span_of(*tg, rva) : Span{};
 			if (s.found) {
 				std::snprintf(buf, sizeof(buf), "SkyrimSE.exe+0x%llX (ID %llu+0x%llX)", static_cast<unsigned long long>(rva),
 					static_cast<unsigned long long>(s.id), static_cast<unsigned long long>(s.delta));
@@ -171,7 +190,17 @@ namespace bridge
 						continue;
 					}
 					const unsigned slot = static_cast<unsigned>(k);
-					if (vi.changed && slot >= vi.insertAt) {
+					if (vi.changed && dir < 0 && slot >= vi.insertAt) {
+						const int now = slot >= vi.insertAt + vi.added ? static_cast<int>(slot - vi.added) : -1;
+						std::snprintf(buf, sizeof(buf),
+							"vtable %s slot %u. The plugin was built for 1.7.99+, where %s has %u more slot(s) from index %u; on this game "
+							"slot %u is a different function, and the function the plugin meant is %s",
+							vi.cls.c_str(), slot, vi.base.c_str(), vi.added, vi.insertAt, slot,
+							now >= 0 ? ("slot " + std::to_string(now)).c_str() : "not present in this runtime");
+						note = buf;
+						return Kind::block;
+					}
+					if (vi.changed && dir > 0 && slot >= vi.insertAt) {
 						const int was = slot >= vi.insertAt + vi.added ? static_cast<int>(slot - vi.added) : -1;
 						std::snprintf(buf, sizeof(buf),
 							"vtable %s slot %u. %s gained %u slot(s) at index %u in 1.7.99: slot %u now holds %s; a plugin built for "
@@ -190,6 +219,10 @@ namespace bridge
 				return Kind::ok;
 			}
 
+			if (!tg) {
+				note = "plugin built for this runtime; not judged";
+				return Kind::ok;
+			}
 			if (!s.found) {
 				note = "code with no Address Library ID nearby; not judged";
 				return Kind::warn;
@@ -199,17 +232,17 @@ namespace bridge
 				return Kind::ok;
 			}
 			if (s.now && s.then && s.now == s.then) {
-				std::snprintf(buf, sizeof(buf), "in-function +0x%llX; ID span unchanged (0x%llX) since 1.6.1170, offset plausibly still valid",
+				std::snprintf(buf, sizeof(buf), "in-function +0x%llX; ID span unchanged (0x%llX) since the plugin's runtime, offset plausibly still valid",
 					static_cast<unsigned long long>(s.delta), static_cast<unsigned long long>(s.now));
 				note = buf;
 				return Kind::ok;
 			}
 			char spans[96];
 			if (s.then) {
-				std::snprintf(spans, sizeof(spans), "0x%llX in 1.6.1170, 0x%llX now", static_cast<unsigned long long>(s.then),
+				std::snprintf(spans, sizeof(spans), "0x%llX in the plugin's runtime, 0x%llX now", static_cast<unsigned long long>(s.then),
 					static_cast<unsigned long long>(s.now));
 			} else {
-				std::snprintf(spans, sizeof(spans), "unknown in 1.6.1170, 0x%llX now", static_cast<unsigned long long>(s.now));
+				std::snprintf(spans, sizeof(spans), "unknown in the plugin's runtime, 0x%llX now", static_cast<unsigned long long>(s.now));
 			}
 			// The instruction a write of this size normally replaces. Only the first bytes are checked (no disassembler),
 			// so a match is evidence that the site is right, not proof.
@@ -244,11 +277,11 @@ namespace bridge
 			if (want) {
 				std::snprintf(buf, sizeof(buf),
 					"in-function +0x%llX of a function that changed size (%s). A %zu-byte patch replaces a %s, but the game has %s here: "
-					"the offset was taken from 1.6.1170 code and misses on this runtime",
+					"the offset was taken from older code and misses on this runtime",
 					static_cast<unsigned long long>(s.delta), spans, n, want, hex(b, std::min<std::size_t>(have, 8)).c_str());
 			} else {
 				std::snprintf(buf, sizeof(buf),
-					"%zu-byte write at in-function +0x%llX of a function that changed size (%s); bytes chosen for 1.6.1170 code, unverifiable here",
+					"%zu-byte write at in-function +0x%llX of a function that changed size (%s); bytes chosen for the plugin's runtime, unverifiable here",
 					n, static_cast<unsigned long long>(s.delta), spans);
 			}
 			note = buf;
@@ -273,27 +306,43 @@ namespace bridge
 		}
 	}
 
-	void patch_audit_init(const std::vector<IdEntry>& legacy, const std::vector<IdEntry>& current, bool guard)
+	void patch_audit_init(const std::vector<IdEntry>& current, bool guard)
 	{
 		AcquireSRWLockExclusive(&g_lock);
-		g_leg = legacy;
-		g_cur.clear();
-		g_legCommon.clear();
-		g_cur.reserve(current.size());
-		g_legCommon.reserve(current.size());
-		for (const auto& e : current) {
-			const auto it = std::lower_bound(g_leg.begin(), g_leg.end(), e.id, [](const IdEntry& x, std::uint64_t v) { return x.id < v; });
-			if (it != g_leg.end() && it->id == e.id) {
-				g_cur.push_back({ e.offset, e.id });
-				g_legCommon.push_back(it->offset);
+		g_current = current;
+		g_guard = guard;
+		g_ready = !g_current.empty();
+		ReleaseSRWLockExclusive(&g_lock);
+		logf("patch audit: %zu IDs in the game's library; patch_guard=%d", g_current.size(), guard ? 1 : 0);
+	}
+
+	void patch_audit_target(const std::string& module, const Version& target, const std::vector<IdEntry>& plugin, int direction)
+	{
+		AcquireSRWLockExclusive(&g_lock);
+		const Target* t = nullptr;
+		for (const auto& x : g_targets) {
+			if (x.version == target) {
+				t = &x;
 			}
 		}
-		std::sort(g_cur.begin(), g_cur.end());
-		std::sort(g_legCommon.begin(), g_legCommon.end());
-		g_guard = guard;
-		g_ready = !g_cur.empty();
+		if (!t) {
+			Target& n = g_targets.emplace_back();
+			n.version = target;
+			n.leg = plugin;
+			for (const auto& e : g_current) {
+				const auto it = std::lower_bound(n.leg.begin(), n.leg.end(), e.id, [](const IdEntry& x, std::uint64_t v) { return x.id < v; });
+				if (it != n.leg.end() && it->id == e.id) {
+					n.cur.push_back({ e.offset, e.id });
+					n.legCommon.push_back(it->offset);
+				}
+			}
+			std::sort(n.cur.begin(), n.cur.end());
+			std::sort(n.legCommon.begin(), n.legCommon.end());
+			t = &n;
+			logf("patch audit: %s vs this game: %zu IDs in both", target.str('.').c_str(), n.cur.size());
+		}
+		g_modTarget[module] = { t, direction };
 		ReleaseSRWLockExclusive(&g_lock);
-		logf("patch audit: %zu IDs present in both libraries; patch_guard=%d", g_cur.size(), guard ? 1 : 0);
 	}
 
 	bool patch_audit_protect(const std::string& module, void* p, std::size_t size, DWORD newProtect)

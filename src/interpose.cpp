@@ -17,6 +17,8 @@
 // does with versions or IDs inside DllMain / static initializers has already run unpatched.
 #include "common.h"
 
+#include <deque>
+
 #if defined(_MSC_VER)
 #	include <intrin.h>
 #	define BRIDGE_RETURN_ADDRESS() _ReturnAddress()
@@ -36,13 +38,14 @@ namespace bridge
 			std::uintptr_t  end{ 0 };
 			std::string     name;
 			InterposeConfig cfg;
+			const wchar_t*  spoofW{ L"" };  // stable storage in g_spoofStrings
+			const char*     spoofA{ "" };
 		};
+		std::deque<std::pair<std::wstring, std::string>> g_spoofStrings;  // one per spoofed version, never freed
 
 		SRWLOCK                g_lock = SRWLOCK_INIT;
 		std::vector<ModuleCtx> g_modules;
 		std::vector<const void*> g_exeBlocks;  // version-info buffers known to describe the game exe
-		wchar_t                g_spoofString[32]{};
-		char                   g_spoofStringA[32]{};
 		VS_FIXEDFILEINFO       g_spoofFixed{};
 
 		bool find_ctx(const void* addr, ModuleCtx& out)
@@ -285,9 +288,9 @@ namespace bridge
 			}
 			const std::wstring key = widen(sub);
 			if (ends_with_i(key, L"\\ProductVersion") || ends_with_i(key, L"\\FileVersion")) {
-				*buffer = g_spoofStringA;
-				*len = static_cast<UINT>(std::strlen(g_spoofStringA) + 1);
-				logf("[interpose] %s: VerQueryValueA(\"%s\") -> \"%s\" (spoofed)", ctx.name.c_str(), sub, g_spoofStringA);
+				*buffer = const_cast<char*>(ctx.spoofA);
+				*len = static_cast<UINT>(std::strlen(ctx.spoofA) + 1);
+				logf("[interpose] %s: VerQueryValueA(\"%s\") -> \"%s\" (spoofed)", ctx.name.c_str(), sub, ctx.spoofA);
 				return TRUE;
 			}
 			if (key == L"\\") {
@@ -315,10 +318,10 @@ namespace bridge
 			}
 			const std::wstring_view key(sub);
 			if (ends_with_i(key, L"\\ProductVersion") || ends_with_i(key, L"\\FileVersion")) {
-				*buffer = g_spoofString;
-				*len = static_cast<UINT>(std::wcslen(g_spoofString) + 1);
+				*buffer = const_cast<wchar_t*>(ctx.spoofW);
+				*len = static_cast<UINT>(std::wcslen(ctx.spoofW) + 1);
 				logf("[interpose] %s: VerQueryValueW(\"%s\") -> \"%s\" (spoofed)", ctx.name.c_str(), narrow(key).c_str(),
-					narrow(g_spoofString).c_str());
+					narrow(ctx.spoofW).c_str());
 				return TRUE;
 			}
 			if (key == L"\\") {
@@ -469,12 +472,14 @@ namespace bridge
 
 		AcquireSRWLockExclusive(&g_lock);
 		if (cfg.spoofVersion) {
-			const auto s = cfg.spoof.wstr(L'.');
-			std::wmemset(g_spoofString, 0, std::size(g_spoofString));
-			std::wmemcpy(g_spoofString, s.c_str(), std::min<std::size_t>(s.size(), std::size(g_spoofString) - 1));
-			const auto a = cfg.spoof.str('.');
-			std::memset(g_spoofStringA, 0, sizeof(g_spoofStringA));
-			std::memcpy(g_spoofStringA, a.c_str(), std::min<std::size_t>(a.size(), sizeof(g_spoofStringA) - 1));
+			const std::wstring w = cfg.spoof.wstr(L'.');
+			auto it = std::find_if(g_spoofStrings.begin(), g_spoofStrings.end(), [&](const auto& p) { return p.first == w; });
+			if (it == g_spoofStrings.end()) {
+				g_spoofStrings.emplace_back(w, cfg.spoof.str('.'));
+				it = std::prev(g_spoofStrings.end());
+			}
+			ctx.spoofW = it->first.c_str();
+			ctx.spoofA = it->second.c_str();
 		}
 		g_modules.push_back(ctx);
 		ReleaseSRWLockExclusive(&g_lock);
@@ -485,8 +490,10 @@ namespace bridge
 			r.getFileVersionInfoA = patch_iat(legacy, "GetFileVersionInfoA", reinterpret_cast<void*>(&Hook_GetFileVersionInfoA));
 			r.verQueryValueA = patch_iat(legacy, "VerQueryValueA", reinterpret_cast<void*>(&Hook_VerQueryValueA));
 		}
-		r.openFileMappingW = patch_iat(legacy, "OpenFileMappingW", reinterpret_cast<void*>(&Hook_OpenFileMappingW));
-		r.createFileMappingW = patch_iat(legacy, "CreateFileMappingW", reinterpret_cast<void*>(&Hook_CreateFileMappingW));
+		if (cfg.idTable) {
+			r.openFileMappingW = patch_iat(legacy, "OpenFileMappingW", reinterpret_cast<void*>(&Hook_OpenFileMappingW));
+			r.createFileMappingW = patch_iat(legacy, "CreateFileMappingW", reinterpret_cast<void*>(&Hook_CreateFileMappingW));
+		}
 		if (!cfg.presentPath.empty()) {
 			const std::pair<const char*, void*> pathHooks[] = {
 				{ "GetModuleFileNameW", reinterpret_cast<void*>(&Hook_GetModuleFileNameW) },

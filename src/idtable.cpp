@@ -275,18 +275,92 @@ namespace bridge
 	// Source: CommonLibSSE-NG 9955ae3 (AE_CHECK(SKSE::RUNTIME_SSE_1_7_99, old, new) call sites). [Verified]
 	// Checked against Address Library v13 files: each old ID exists in 1.6.1170, is absent from 1.7.99 and
 	// 1.7.104, and each new ID exists in both. Same function signature on both sides of AE_CHECK.
-	RemapRules known_remaps(const Version& legacy, const Version& game)
+	RemapRules known_remaps(const Version& plugin, const Version& game)
 	{
-		static constexpr Version k1799{ { 1, 7, 99, 0 } };
-		if (legacy.v[0] != 1 || legacy.v[1] != 6 || game.less(k1799)) {
-			return {};
-		}
-		return {
-			{ 47286, 523983 },  // CombatUtilities GetAngleToProjectedTarget  (include/RE/C/CombatUtilities.h:15)
-			{ 82331, 524270 },  // BSScaleformManager::IsValidName            (src/RE/B/BSScaleformManager.cpp:21)
-			{ 77235, 524254 },  // BSGraphics::Renderer::RequestWindowResize  (src/RE/R/Renderer.cpp:112)
-			{ 13358, 523463 },  // TES::GetWaterHeight                        (src/RE/T/TES.cpp:209)
+		struct Update
+		{
+			Version                                                     boundary;
+			std::vector<std::pair<std::uint64_t, std::uint64_t>>      pairs;  // old ID (before) -> new ID (from boundary on)
 		};
+		static const Update kUpdates[] = {
+			// CommonLibSSE-NG 539d4ce AE_CHECK(SKSE::RUNTIME_SSE_1_6_1130, old, new) call sites [Verified]
+			{ Version{ { 1, 6, 1130, 0 } }, {
+				{ 21890, 441582 },
+				{ 69188, 443410 },   // BSScaleformTranslator::GetCachedString (src/RE/B/BSScaleformTranslator.cpp:9)
+				{ 405935, 504099 },
+			} },
+			// CommonLibSSE-NG 9955ae3 AE_CHECK(SKSE::RUNTIME_SSE_1_7_99, old, new) call sites [Verified]; checked against
+			// Address Library v13: each old ID exists in 1.6.1170 and not in 1.7.99/1.7.104, each new ID in both.
+			{ Version{ { 1, 7, 99, 0 } }, {
+				{ 47286, 523983 },  // CombatUtilities GetAngleToProjectedTarget  (include/RE/C/CombatUtilities.h:15)
+				{ 82331, 524270 },  // BSScaleformManager::IsValidName            (src/RE/B/BSScaleformManager.cpp:21)
+				{ 77235, 524254 },  // BSGraphics::Renderer::RequestWindowResize  (src/RE/R/Renderer.cpp:112)
+				{ 13358, 523463 },  // TES::GetWaterHeight                        (src/RE/T/TES.cpp:209)
+			} },
+		};
+		RemapRules out;
+		if (plugin.v[0] != 1 || plugin.v[1] < 6 || game.v[0] != 1 || game.v[1] < 6) {
+			return out;  // Address Library IDs of 1.5.x use a different numbering
+		}
+		for (const auto& u : kUpdates) {
+			const bool forward = plugin.less(u.boundary) && !game.less(u.boundary);
+			const bool reverse = game.less(u.boundary) && !plugin.less(u.boundary);
+			for (const auto& [o, n] : u.pairs) {
+				if (forward) {
+					out.emplace_back(o, n);
+				} else if (reverse) {
+					out.emplace_back(n, o);
+				}
+			}
+		}
+		return out;
+	}
+
+	RemapRules infer_remaps(const std::vector<IdEntry>& plugin, const std::vector<IdEntry>& game)
+	{
+		const auto has = [](const std::vector<IdEntry>& v, std::uint64_t id) {
+			const auto it = std::lower_bound(v.begin(), v.end(), id, [](const IdEntry& e, std::uint64_t x) { return e.id < x; });
+			return it != v.end() && it->id == id ? &*it : static_cast<const IdEntry*>(nullptr);
+		};
+		struct A
+		{
+			std::uint64_t pOff, gOff;
+		};
+		std::vector<A> anchors;  // IDs in both, by plugin-side offset
+		anchors.reserve(plugin.size());
+		for (const auto& e : plugin) {
+			if (const IdEntry* g = has(game, e.id)) {
+				anchors.push_back({ e.offset, g->offset });
+			}
+		}
+		std::sort(anchors.begin(), anchors.end(), [](const A& x, const A& y) { return x.pOff < y.pOff; });
+		std::vector<std::pair<std::uint64_t, std::uint64_t>> gameOnly;  // (offset, id) of IDs the plugin side lacks
+		for (const auto& e : game) {
+			if (!has(plugin, e.id)) {
+				gameOnly.emplace_back(e.offset, e.id);
+			}
+		}
+		std::sort(gameOnly.begin(), gameOnly.end());
+		RemapRules out;
+		for (const auto& e : plugin) {
+			if (has(game, e.id)) {
+				continue;
+			}
+			auto it = std::upper_bound(anchors.begin(), anchors.end(), e.offset, [](std::uint64_t v, const A& x) { return v < x.pOff; });
+			if (it == anchors.begin()) {
+				continue;
+			}
+			const A&            an = *std::prev(it);
+			const std::uint64_t predicted = an.gOff + (e.offset - an.pOff);
+			if (it != anchors.end() && predicted >= it->gOff) {
+				continue;  // would cross the next common ID: the region changed, no prediction
+			}
+			const auto g = std::lower_bound(gameOnly.begin(), gameOnly.end(), std::make_pair(predicted, std::uint64_t{ 0 }));
+			if (g != gameOnly.end() && g->first == predicted) {
+				out.emplace_back(e.id, g->second);
+			}
+		}
+		return out;
 	}
 
 	HANDLE make_mapping(const std::vector<IdEntry>& table)

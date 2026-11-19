@@ -117,6 +117,9 @@ namespace bridge
 		if (strOffsetsMap && strVersionlib) {
 			return strVersionSE ? "B" : "A";
 		}
+		if (strIddbShared) {
+			return "commonlib-shared";  // loads any Address Library format itself and validates the file: run natively
+		}
 		return "unknown";
 	}
 
@@ -245,6 +248,7 @@ namespace bridge
 		r.strVersionlib = contains_text(d, "versionlib-");
 		r.strVersionSE = contains_text(d, "Plugins/version-");
 		r.strSkseRuntime = contains_text(d, "SKSE_RUNTIME");
+		r.strIddbShared = contains_text(d, "COMMONLIB_IDDB_OFFSETS_");
 		r.ok = true;
 		return r;
 	}
@@ -313,8 +317,8 @@ namespace bridge
 			}
 			logf("  import %s (%zu): %s", imp.dll.c_str(), imp.names.size(), line.c_str());
 		}
-		logf("  strings: CommonLibSSEOffsets=%d versionlib-=%d Plugins/version-=%d SKSE_RUNTIME=%d",
-			r.strOffsetsMap ? 1 : 0, r.strVersionlib ? 1 : 0, r.strVersionSE ? 1 : 0, r.strSkseRuntime ? 1 : 0);
+		logf("  strings: CommonLibSSEOffsets=%d versionlib-=%d Plugins/version-=%d SKSE_RUNTIME=%d COMMONLIB_IDDB_OFFSETS_=%d",
+			r.strOffsetsMap ? 1 : 0, r.strVersionlib ? 1 : 0, r.strVersionSE ? 1 : 0, r.strSkseRuntime ? 1 : 0, r.strIddbShared ? 1 : 0);
 		logf("  lineage: Case %s (string heuristic)", r.lineage());
 	}
 }
