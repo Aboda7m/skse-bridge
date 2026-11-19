@@ -471,9 +471,10 @@ games. Table control: legacy NG via the translated table; commonlib-shared via `
 ("COMMONLIB_IDDB_OFFSETS_<ver>")`, which that library opens before creating and then uses as-is
 (commonlib-shared `include/REX/FMemoryMap.h:106`, `src/REL/IDDB.cpp` load_v2/load_v5) [Verified, HEAD source].
 
-**Decision**: `[VMShadow] <dll>=1/0`, else `SKSE-Bridge.decisions.json` (key = file + SHA-256 prefix), else a
-Yes/No/Cancel question before the plugin loads. `session_open` is set while a shadowed session has not reached a
-loaded game; if still set on the next launch, saved "yes" answers are asked again.
+**Decision**: `[VMShadow] <dll>=1/0`, else the saved answer (0.7.1: `Data\SKSE\Plugins\SKSE-Bridge\ShadowVM\<dll>.json`, one file per plugin with its SHA-256; 0.7.0 used one file in the SKSE log folder), else a
+Yes/No/Cancel question before the plugin loads. `ShadowVM\_session_open.txt` exists while a shadowed session has not
+reached a loaded game; if still there on the next launch, saved "yes" answers are asked again (deleted at startup
+when nothing is shadowed).
 
 **Not covered**: a `SkyrimVM*` the game passes into a plugin hook; pointer comparisons between S and the real
 object; game code that receives S (mapped with the last plugin layout on that thread, logged as `<game code>`);
@@ -487,3 +488,24 @@ shadowed (hot object, pointer identity everywhere) — Rain Extinguishes Fires' 
 from +0x300 -> real +0x2F0, `movups` +0x220 -> real +0x210; real +0x688/+0x690 untouched. 1.6-layout legacy NG
 mock on a 1.7.99 game: +0x200 -> real +0x210, write +0x680 -> real +0x690. 0 unresolved. All earlier harnesses
 unchanged. Builds; needs in-game verification.
+
+
+### 0.7.0 field result and [PresentVersion]
+- **Cooking Skill Overhaul on 1.6.1170 with the shadow** (user's logs, example-sources/free cooking logs SKSE):
+  detection `+0xF8167 +0x121A48`, commonlib-shared table answered, `FreeCooking.dll reads SkyrimVM+0x210 -> real
+  +0x200 at FreeCooking.dll+0xF8167` (the former crash site), 0 unresolved, 0 `[fault]` lines; the plugin's own log
+  shows the cooking menu opening and loading repeatedly. [Verified from logs; full feature coverage not checked.]
+- **[PresentVersion] <dll>=<version>**: reports that version through the SKSE interface to one plugin, nothing else.
+  For plugins with their own version list (Rain Extinguishes Fires checks `a_skse->RuntimeVersion()` against
+  1.7.99/1.7.104, src/Export/SKSEPlugin.cpp:128-155). The commonlib-shared Address Library loader reads the exe
+  version (FModule), so it still loads the running game's library. Diagnostics treat the plugin as built for that
+  version (vtable direction, VM layout default). Harness: version-checking mock refused without it, passed with it.
+  Known risk for REF specifically: its inline `player->AddEventSink<BGSActorCellEvent>` uses the 1.7 PlayerCharacter
+  offset (0x2E0 vs 0x2D8 on 1.6; fork header) and writes into the wrong event source; not covered by any shadow.
+
+
+### 0.7.1
+Version 0.7.1. Shadow answers moved to one JSON per plugin under `Data\SKSE\Plugins\SKSE-Bridge\ShadowVM\`
+(fields plugin, sha256, shadow_vm, note); the 0.7.0 file in the log folder is no longer read. Harness: undecided
+with ask_on_startup=0 -> off; saved true -> shadow on (redirect verified); saved for another build -> asked again;
+stale session marker -> saved yes not trusted, marker removed when nothing is shadowed.

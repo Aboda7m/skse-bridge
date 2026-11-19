@@ -14,7 +14,7 @@ namespace bridge
 {
 	namespace
 	{
-		constexpr Version kHostVersion{ { 0, 7, 0, 0 } };
+		constexpr Version kHostVersion{ { 0, 7, 1, 0 } };
 
 		struct Config
 		{
@@ -251,62 +251,83 @@ namespace bridge
 			logf("  missing-ID list: %s", narrow(path).c_str());
 		}
 
-		// ---- decisions file: Documents\My Games\...\SKSE\SKSE-Bridge.decisions.json ----
-		// Flat JSON object of "key": true|false. Keys: "shadow_vm|<dll>|<sha256 prefix>", "session_open".
-		struct Decisions
-		{
-			std::map<std::string, bool> m;
-			bool                        loaded{ false };
-		};
-		Decisions g_dec;
-		SRWLOCK   g_decLock = SRWLOCK_INIT;
+		// ---- shadow VM decisions: Data\SKSE\Plugins\SKSE-Bridge\ShadowVM\<dll>.json, one file per plugin ----
+		// Easy to find, edit or delete with the mod (under MO2 they land in Overwrite). Deleting a file = ask again.
+		// The file records the DLL's SHA-256 prefix: an updated DLL is asked about again.
+		// _session_open.txt exists while a session with a shadowed plugin has not reached a loaded game.
+		SRWLOCK g_decLock = SRWLOCK_INIT;
 
-		std::wstring decisions_path() { return log_dir() + L"SKSE-Bridge.decisions.json"; }
-
-		void decisions_load()
+		std::wstring shadow_dir()
 		{
-			if (g_dec.loaded) {
-				return;
+			const std::wstring root = game_dir() + L"Data\\SKSE\\Plugins\\SKSE-Bridge\\";
+			CreateDirectoryW(root.c_str(), nullptr);
+			const std::wstring dir = root + L"ShadowVM\\";
+			CreateDirectoryW(dir.c_str(), nullptr);
+			return dir;
+		}
+
+		bool write_text(const std::wstring& path, const std::string& text)
+		{
+			const HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (h == INVALID_HANDLE_VALUE) {
+				return false;
 			}
-			g_dec.loaded = true;
+			DWORD w = 0;
+			WriteFile(h, text.data(), static_cast<DWORD>(text.size()), &w, nullptr);
+			CloseHandle(h);
+			return true;
+		}
+
+		// "key": "string" or "key": true|false from a small flat JSON text.
+		std::string json_value(const std::string& t, const std::string& key)
+		{
+			const auto k = t.find("\"" + key + "\"");
+			if (k == std::string::npos) {
+				return {};
+			}
+			auto v = t.find_first_not_of(" \t\r\n:", k + key.size() + 2);
+			if (v == std::string::npos) {
+				return {};
+			}
+			if (t[v] == '"') {
+				const auto e = t.find('"', v + 1);
+				return e == std::string::npos ? std::string{} : t.substr(v + 1, e - v - 1);
+			}
+			const auto e = t.find_first_of(",}\r\n", v);
+			std::string r = t.substr(v, e == std::string::npos ? std::string::npos : e - v);
+			while (!r.empty() && (r.back() == ' ' || r.back() == '\t')) {
+				r.pop_back();
+			}
+			return r;
+		}
+
+		// Saved answer for this DLL build: 1 yes, 0 no, -1 none.
+		int read_decision(const std::wstring& file, const std::string& sha)
+		{
 			std::vector<std::uint8_t> raw;
 			std::string               err;
-			if (!read_file(decisions_path(), raw, err)) {
-				return;
+			if (!read_file(shadow_dir() + file + L".json", raw, err)) {
+				return -1;
 			}
 			const std::string t(raw.begin(), raw.end());
-			std::size_t       p = 0;
-			while ((p = t.find('"', p)) != std::string::npos) {
-				const auto e = t.find('"', p + 1);
-				if (e == std::string::npos) {
-					break;
-				}
-				const std::string key = t.substr(p + 1, e - p - 1);
-				auto              v = t.find_first_not_of(" \t\r\n:", e + 1);
-				if (v != std::string::npos && t.compare(v, 4, "true") == 0) {
-					g_dec.m[key] = true;
-				} else if (v != std::string::npos && t.compare(v, 5, "false") == 0) {
-					g_dec.m[key] = false;
-				}
-				p = e + 1;
+			const std::string saved = json_value(t, "sha256");
+			if (!saved.empty() && !sha.empty() && saved.substr(0, 16) != sha.substr(0, 16)) {
+				logf("  vm-shadow: saved answer is for another build of %s (sha256 %s...); asking again", narrow(file).c_str(), saved.substr(0, 16).c_str());
+				return -1;
 			}
+			const std::string v = json_value(t, "shadow_vm");
+			return v == "true" ? 1 : (v == "false" ? 0 : -1);
 		}
 
-		void decisions_save()
+		void write_decision(const std::wstring& file, const std::string& sha, bool on)
 		{
-			std::string out = "{\r\n";
-			std::size_t i = 0;
-			for (const auto& [k, v] : g_dec.m) {
-				out += "  \"" + k + "\": " + (v ? "true" : "false") + (++i < g_dec.m.size() ? ",\r\n" : "\r\n");
-			}
-			out += "}\r\n";
-			const HANDLE h = CreateFileW(decisions_path().c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-			if (h != INVALID_HANDLE_VALUE) {
-				DWORD w = 0;
-				WriteFile(h, out.data(), static_cast<DWORD>(out.size()), &w, nullptr);
-				CloseHandle(h);
-			}
+			const std::string text = "{\r\n  \"plugin\": \"" + narrow(file) + "\",\r\n  \"sha256\": \"" + sha + "\",\r\n  \"shadow_vm\": " + (on ? "true" : "false") +
+			                         ",\r\n  \"note\": \"Written by SKSE-Bridge. true = run this plugin with the shadow SkyrimVM, false = load it normally. Delete this file to be asked again.\"\r\n}\r\n";
+			write_text(shadow_dir() + file + L".json", text);
 		}
+
+		std::wstring session_marker() { return shadow_dir() + L"_session_open.txt"; }
+		bool         g_anyShadow = false;  // a plugin runs with the shadow this session
 
 		// Shadow decision for one plugin: [VMShadow] <dll>=0/1, then the decisions file, then a question.
 		bool decide_shadow(const Config& c, const std::wstring& file, const PeReport& rep, bool plugin17, bool game17, bool lastCrashed)
@@ -317,11 +338,9 @@ namespace bridge
 				logf("  vm-shadow: %s by [VMShadow] %s", on ? "ON" : "off", narrow(file).c_str());
 				return on;
 			}
-			decisions_load();
-			const std::string key = "shadow_vm|" + narrow(file) + "|" + rep.sha256.substr(0, 16);
-			if (const auto it = g_dec.m.find(key); it != g_dec.m.end() && !(lastCrashed && it->second)) {
-				logf("  vm-shadow: %s (saved decision in %s)", it->second ? "ON" : "off", narrow(decisions_path()).c_str());
-				return it->second;
+			if (const int saved = read_decision(file, rep.sha256); saved >= 0 && !(lastCrashed && saved == 1)) {
+				logf("  vm-shadow: %s (saved answer in %s%s.json)", saved ? "ON" : "off", narrow(shadow_dir()).c_str(), narrow(file).c_str());
+				return saved == 1;
 			}
 			if (!c.vmAsk) {
 				logf("  vm-shadow: off (undecided and ask_on_startup=0)");
@@ -334,7 +353,7 @@ namespace bridge
 				text += L"Note: the last session with the shadow VM did not reach a loaded game.\n\n";
 			}
 			text += L"Run it with a shadow VM (EXPERIMENTAL)?\n\nYes = use the shadow VM\nNo = load it normally\nCancel = do not load this plugin this session (asked again next launch)\n\n"
-			        L"Your choice is saved in Documents\\My Games\\Skyrim Special Edition\\SKSE\\SKSE-Bridge.decisions.json.";
+			        L"Your choice is saved in Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\" + file + L".json (delete it to be asked again).";
 			const int r = MessageBoxW(nullptr, text.c_str(), L"SKSE-Bridge", MB_YESNOCANCEL | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND);
 			if (r == IDCANCEL) {
 				logf("  vm-shadow: user chose Cancel: plugin not loaded this session");
@@ -342,10 +361,9 @@ namespace bridge
 			}
 			const bool on = r == IDYES;
 			AcquireSRWLockExclusive(&g_decLock);
-			g_dec.m[key] = on;
-			decisions_save();
+			write_decision(file, rep.sha256, on);
 			ReleaseSRWLockExclusive(&g_decLock);
-			logf("  vm-shadow: %s (asked; saved)", on ? "ON" : "off");
+			logf("  vm-shadow: %s (asked; saved to %s%s.json)", on ? "ON" : "off", narrow(shadow_dir()).c_str(), narrow(file).c_str());
 			return on;
 		}
 
@@ -502,6 +520,23 @@ namespace bridge
 			if (!c.translate || !pf.ok) {
 				plan.translate = false;
 			}
+			// [PresentVersion] <dll>=<version>: the runtime version the SKSE interface reports to this plugin only, for plugins
+			// whose own code refuses unknown versions (e.g. a list of 1.7 versions) but that load the Address Library of the
+			// running game themselves. Nothing else is spoofed; the plugin's compiled structure layouts are unchanged.
+			Version presentVersion{};
+			bool    hasPresent = false;
+			if (const std::wstring pv = ini_string(c.ini, L"PresentVersion", file.c_str(), L""); !pv.empty()) {
+				if (Version::parse(pv, presentVersion)) {
+					hasPresent = true;
+					if (!plan.translate) {
+						plan.target = presentVersion;  // diagnostics (vtable direction, VM layout default) follow the claimed build
+					}
+					logf("  [PresentVersion] SKSE interface will report %s to this plugin (EXPERIMENTAL; its structure layouts are those of its own build)",
+						presentVersion.str('.').c_str());
+				} else {
+					logf("  [PresentVersion] %s: \"%s\" is not a version; ignored", narrow(file).c_str(), narrow(pv).c_str());
+				}
+			}
 			const int direction = vtable_direction(plan.target, pf.ok ? pf.real : plan.target);
 			logf("  target: built for %s, game %s -> %s (%s)", plan.target.str('.').c_str(), pf.real.str('.').c_str(),
 				plan.translate ? "TRANSLATED" : "loaded natively", plan.why.c_str());
@@ -547,8 +582,7 @@ namespace bridge
 						vs.votes17, vs.layout ? "" : " assumed", plugin17 ? "1.7" : "1.6", vs.layout ? "code evidence" : "from target version",
 						sites.c_str());
 					if (plugin17 != game17) {
-						decisions_load();
-						const bool lastCrashed = g_dec.m.count("session_open") && g_dec.m["session_open"];
+						const bool lastCrashed = file_exists(session_marker());
 						try {
 							shadowVm = decide_shadow(c, file, rep, plugin17, game17, lastCrashed);
 						} catch (const std::exception&) {
@@ -558,10 +592,8 @@ namespace bridge
 							shadowVm = false;
 						}
 						if (shadowVm) {
-							AcquireSRWLockExclusive(&g_decLock);
-							g_dec.m["session_open"] = true;
-							decisions_save();
-							ReleaseSRWLockExclusive(&g_decLock);
+							write_text(session_marker(), "A session with a shadowed plugin has not reached a loaded game yet.\r\n");
+							g_anyShadow = true;
 						}
 					} else {
 						logf("  SkyrimVM: same layout as the game; no shadow needed");
@@ -719,6 +751,9 @@ namespace bridge
 			if (plan.translate && c.spoofSkseRuntime) {
 				iface->runtimeVersion = plan.target.pack();
 			}
+			if (hasPresent) {
+				iface->runtimeVersion = presentVersion.pack();
+			}
 			logf("  calling SKSEPlugin_Load (runtimeVersion presented: %s)", Version::unpack(iface->runtimeVersion).str('.').c_str());
 			bool          result = false;
 			unsigned long code = 0;
@@ -741,12 +776,10 @@ namespace bridge
 {
 	void vm_session_reached_game()
 	{
-		AcquireSRWLockExclusive(&g_decLock);
-		if (g_dec.m.count("session_open") && g_dec.m["session_open"]) {
-			g_dec.m["session_open"] = false;
-			decisions_save();
+		const std::wstring m = session_marker();
+		if (file_exists(m)) {
+			DeleteFileW(m.c_str());
 		}
-		ReleaseSRWLockExclusive(&g_decLock);
 	}
 }
 
@@ -828,6 +861,9 @@ extern "C"
 		}
 		for (std::size_t i = 0; i < plugins.size(); ++i) {
 			host_one(c, pf, skse, plugins[i], reports[i]);
+		}
+		if (!g_anyShadow && file_exists(game_dir() + L"Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\_session_open.txt")) {
+			DeleteFileW((game_dir() + L"Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\_session_open.txt").c_str());  // nothing shadowed this session
 		}
 		logf("done");
 		return true;

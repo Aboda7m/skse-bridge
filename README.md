@@ -95,6 +95,14 @@ own code.
 - **Newer plugins on an older game.** A plugin built for 1.7 on a 1.6 game, or for 1.6.1170 on 1.6.640, has the
   newer structure layouts compiled in. ID translation and the log help; the layouts still need a rebuild.
 
+## What's new in 0.7.1 (experimental)
+
+- Shadow VM answers are now one file per plugin in `Data\SKSE\Plugins\SKSE-Bridge\ShadowVM\<plugin>.dll.json`
+  (easy to find, edit or delete; under MO2 they appear in Overwrite). Delete a file to be asked again.
+- `[PresentVersion] <plugin>.dll=<version>`: report a different game version to one plugin whose own code refuses
+  the running version (experimental; the plugin's compiled layouts are not changed).
+- Cooking Skill Overhaul on 1.6.1170 runs with the shadow VM (former crash fixed in the field test).
+
 ## What's new in 0.7.0 (experimental)
 
 - **Shadow SkyrimVM.** 1.7 moved members of Skyrim's Papyrus VM object, so plugins built with the other layout
