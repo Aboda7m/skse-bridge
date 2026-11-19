@@ -225,6 +225,7 @@ namespace bridge
 			if (from == "skse" && msg->type == 8) {  // kDataLoaded: most plugins have installed their hooks by now
 				patch_audit_flush("after kDataLoaded");
 				vm_shadow_report("after kDataLoaded");
+				vm_session_reached_game();  // got through startup with the shadow: no reason to re-ask next launch
 			}
 			if (from == "skse" && (msg->type == 3 || msg->type == 7)) {  // kPostLoadGame / kNewGame
 				vm_shadow_report(msg->type == 3 ? "after kPostLoadGame" : "after kNewGame");

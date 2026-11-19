@@ -338,9 +338,16 @@ namespace bridge
 				logf("  vm-shadow: %s by [VMShadow] %s", on ? "ON" : "off", narrow(file).c_str());
 				return on;
 			}
-			if (const int saved = read_decision(file, rep.sha256); saved >= 0 && !(lastCrashed && saved == 1)) {
+			const int saved = read_decision(file, rep.sha256);
+			if (saved >= 0 && !(lastCrashed && saved == 1)) {
 				logf("  vm-shadow: %s (saved answer in %s%s.json)", saved ? "ON" : "off", narrow(shadow_dir()).c_str(), narrow(file).c_str());
 				return saved == 1;
+			}
+			if (saved == 1) {
+				logf("  vm-shadow: saved answer is Yes, but the last launch with the shadow did not reach the main menu (%s exists): asking again",
+					narrow(session_marker()).c_str());
+			} else if (saved < 0) {
+				logf("  vm-shadow: no usable saved answer at %s%s.json", narrow(shadow_dir()).c_str(), narrow(file).c_str());
 			}
 			if (!c.vmAsk) {
 				logf("  vm-shadow: off (undecided and ask_on_startup=0)");
@@ -592,7 +599,7 @@ namespace bridge
 							shadowVm = false;
 						}
 						if (shadowVm) {
-							write_text(session_marker(), "A session with a shadowed plugin has not reached a loaded game yet.\r\n");
+							write_text(session_marker(), "A launch with a shadowed plugin has not reached the main menu (kDataLoaded) yet.\r\n");
 							g_anyShadow = true;
 						}
 					} else {
