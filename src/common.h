@@ -50,6 +50,11 @@ namespace bridge
 			kVersionIndependent_Signatures = 1u << 1,
 			kVersionIndependent_StructsPost629 = 1u << 2,
 			kVersionIndependentEx_NoStructUse = 1u << 0,
+			// Name is ours. skse64_1_7_104.dll (2.3.1) PluginManager check, RVA 0x810A9-0x810DE [Verified by disassembly]:
+			// a plugin with kVersionIndependent_AddressLibraryPostAE but without this bit is rejected with
+			// "must be recompiled for new address library" when its PE TimeDateStamp lies in
+			// [0x1F008600, 0x68338EFF] (1986-06-26 .. 2025-05-25 UTC). Set = "built for the 1.7.x Address Library".
+			kVersionIndependentEx_AddressLibraryV5 = 1u << 1,
 		};
 
 		std::uint32_t dataVersion;

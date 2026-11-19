@@ -461,7 +461,10 @@ extern "C"
 		"SKSE-Bridge",
 		"Aboda7m",
 		"",
-		bridge::PluginVersionData::kVersionIndependentEx_NoStructUse,
+		// AddressLibraryV5: the host reads the 1.7.x (format 5) Address Library itself. Without it SKSE 2.3.1 rejects
+		// the DLL when the linker's TimeDateStamp happens to be a date before 2025-05-26 (lld and MSVC /Brepro write a
+		// hash there, so this varied between builds: 0.4.0 loaded, 0.5.0 did not).
+		bridge::PluginVersionData::kVersionIndependentEx_NoStructUse | bridge::PluginVersionData::kVersionIndependentEx_AddressLibraryV5,
 		bridge::PluginVersionData::kVersionIndependent_AddressLibraryPostAE | bridge::PluginVersionData::kVersionIndependent_StructsPost629,
 		{ 0 },
 		0,

@@ -338,3 +338,13 @@ lengths, ResolveFormId forwarded); second save round-trips. Presented path: `Get
 `Data\SKSE\Plugins\X.dll`; `LoadLibraryW` of that path returns the same module; `GetFileAttributesW` finds it.
 Patch guard: 2-byte write over `ja short` in a changed function → warned and written; over `CC` → blocked;
 allow-listed mid-instruction 5-byte write → written. Old harness unchanged. Builds; needs in-game verification.
+
+
+### 0.5.0 hotfix — SKSE rejected the bridge itself
+Symptom: with the 0.5.0 build SKSE disabled SKSE-Bridge.dll ("must be recompiled for new address library");
+0.4.0 loaded. Cause [Verified, skse64_1_7_104.dll 2.3.1 disassembly, RVA 0x810A9-0x810DE]: for a plugin that
+declares `AddressLibraryPostAE` but not `versionIndependenceEx` bit 1, SKSE reads the DLL's PE TimeDateStamp and
+rejects it if that lies in 0x1F008600..0x68338EFF (1986-06-26 .. 2025-05-25 UTC). lld and MSVC `/Brepro` write a
+content hash there, so whether a build passed was luck (the 0.5.0 hash decoded to 2008). Fix: the host declares
+Ex bit 1 (`kVersionIndependentEx_AddressLibraryV5`, our name); it does read the 1.7.x format-5 library itself.
+Hosted legacy DLLs are never checked by SKSE, so this does not apply to them.
