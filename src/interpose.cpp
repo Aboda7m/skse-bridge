@@ -16,6 +16,7 @@
 // Timing limit: the patch is applied after LoadLibraryW returns, so anything the legacy DLL
 // does with versions or IDs inside DllMain / static initializers has already run unpatched.
 #include "common.h"
+#include "trace.h"
 
 #include <deque>
 
@@ -341,6 +342,44 @@ namespace bridge
 			return ::VerQueryValueW(block, sub, buffer, len);
 		}
 
+#if SKB_TRACE
+		// TEST-ONLY (trace build): remember which handles are duplicates of a hosted plugin's private table, so the
+		// MapViewOfFile hook below can tell the plugin mapping it apart from every other mapping in the process.
+		SRWLOCK                                            g_traceHandleLock = SRWLOCK_INIT;
+		std::vector<std::pair<HANDLE, std::string>>        g_traceHandles;
+
+		void trace_note_handle(HANDLE h, const std::string& plugin)
+		{
+			AcquireSRWLockExclusive(&g_traceHandleLock);
+			g_traceHandles.emplace_back(h, plugin);
+			ReleaseSRWLockExclusive(&g_traceHandleLock);
+		}
+
+		bool trace_plugin_for_handle(HANDLE h, std::string& plugin)
+		{
+			bool found = false;
+			AcquireSRWLockShared(&g_traceHandleLock);
+			for (const auto& e : g_traceHandles) {
+				if (e.first == h) {
+					plugin = e.second;
+					found = true;
+				}
+			}
+			ReleaseSRWLockShared(&g_traceHandleLock);
+			return found;
+		}
+
+		LPVOID WINAPI Hook_MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, SIZE_T bytes)
+		{
+			LPVOID view = ::MapViewOfFile(mapping, access, offHigh, offLow, bytes);
+			std::string plugin;
+			if (view && trace::enabled() && trace_plugin_for_handle(mapping, plugin)) {
+				trace::on_table_view(plugin.c_str(), view, bytes);
+			}
+			return view;
+		}
+#endif
+
 		HANDLE WINAPI Hook_OpenFileMappingW(DWORD access, BOOL inherit, LPCWSTR name)
 		{
 			const void* const caller = BRIDGE_RETURN_ADDRESS();
@@ -351,6 +390,8 @@ namespace bridge
 					if (DuplicateHandle(GetCurrentProcess(), ctx.cfg.mapping, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
 						logf("[interpose] %s: OpenFileMappingW(\"%s\") -> private table (%zu bytes)", ctx.name.c_str(),
 							narrow(name).c_str(), ctx.cfg.mappingBytes);
+						SKB_TRACE_DO(trace_note_handle(dup, ctx.name);
+							trace::emit("table_open", ctx.name, trace::Fields().s("mapping", narrow(name)).u("bytes", ctx.cfg.mappingBytes)));
 						return dup;
 					}
 					logf("[interpose] %s: OpenFileMappingW(\"%s\"): DuplicateHandle failed (%lu)", ctx.name.c_str(),
@@ -509,6 +550,12 @@ namespace bridge
 		if (cfg.idTable) {
 			r.openFileMappingW = patch_iat(legacy, "OpenFileMappingW", reinterpret_cast<void*>(&Hook_OpenFileMappingW));
 			r.createFileMappingW = patch_iat(legacy, "CreateFileMappingW", reinterpret_cast<void*>(&Hook_CreateFileMappingW));
+#if SKB_TRACE
+			if (trace::enabled()) {
+				const int hooked = patch_iat(legacy, "MapViewOfFile", reinterpret_cast<void*>(&Hook_MapViewOfFile));
+				trace::emit("hook", ctx.name, trace::Fields().s("api", "MapViewOfFile").u("sites", static_cast<std::uint64_t>(hooked)));
+			}
+#endif
 		}
 		if (cfg.sharedMapping) {
 			r.openFileMappingA = patch_iat(legacy, "OpenFileMappingA", reinterpret_cast<void*>(&Hook_OpenFileMappingA));

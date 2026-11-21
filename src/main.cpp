@@ -5,6 +5,7 @@
 // and Address Library ID lookups. What it cannot adapt: struct layouts, vtable slots, or any
 // change in what the game code behind an ID does.
 #include "common.h"
+#include "trace.h"
 
 #include <algorithm>
 #include <map>
@@ -599,6 +600,8 @@ namespace bridge
 			if (!c.translate || !pf.ok) {
 				plan.translate = false;
 			}
+			SKB_TRACE_DO(trace::emit("plan", narrow(file),
+				trace::Fields().s("target", plan.target.str('.')).b("translate", plan.translate).s("why", plan.why)));
 			// Per-plugin fixes, decided once and saved in Data\SKSE\Plugins\SKSE-Bridge\ShadowVM\<dll>.json:
 			//   present_version: the runtime version the SKSE interface reports to this plugin only, for plugins whose own
 			//     code refuses the running game (a list of supported versions) but that load the running game's Address
@@ -814,6 +817,7 @@ namespace bridge
 							}
 						}
 					}
+					SKB_TRACE_DO(trace::table_dump(narrow(file), targetLib->entries, pf.entries, table));
 					logf("  table: %zu rows, %zu translated, %zu missing (poisoned), %zu remap rule(s) applied", st.rows, st.translated,
 						st.missing, st.overlaid);
 					write_missing_report(plan.target, *targetLib, pf);
@@ -872,6 +876,7 @@ namespace bridge
 			const DWORD       gle = GetLastError();
 			const EarlyResult early = early_disarm();
 			logf("  T0 LoadLibraryW -> %p (GetLastError=%lu)", static_cast<void*>(mod), static_cast<unsigned long>(mod ? 0 : gle));
+			SKB_TRACE_DO(trace::emit("dll_loaded", narrow(file), trace::Fields().b("ok", mod != nullptr).u("last_error", mod ? 0 : gle)));
 			if (!mod) {
 				return;
 			}
@@ -923,8 +928,10 @@ namespace bridge
 			bool          result = false;
 			unsigned long code = 0;
 			skse_proxy_loading(narrow(file));
+			SKB_TRACE_DO(trace::emit("skse_load_begin", narrow(file)));
 			const bool returned = call_load(fn, iface, &result, &code);
 			skse_proxy_loading({});
+			SKB_TRACE_DO(trace::emit("skse_load_end", narrow(file), trace::Fields().b("returned", returned).b("result", result).x("seh_code", code)));
 			if (returned) {
 				logf("  T1 SKSEPlugin_Load returned %s", result ? "true" : "false");
 			} else {
@@ -989,6 +996,10 @@ extern "C"
 		}
 
 		const Config c = read_config();
+#if SKB_TRACE
+		trace::init(c.ini);  // TEST-ONLY; compiled out of release builds
+		SKB_TRACE_DO(trace::emit("host", {}, trace::Fields().s("version", kHostVersion.str('.')).b("dry_run", c.dryRun).b("translate", c.translate)));
+#endif
 		skse_proxy_init(skse, c.messagingFanout, c.cosaveMux && !c.dryRun);
 		logf("note: assuming SKSE does not scan sub-folders of Data\\SKSE\\Plugins [Assumption]. If skse64.log lists the legacy "
 			 "DLLs itself, move legacy_dir outside Data\\SKSE\\Plugins.");
@@ -1026,8 +1037,12 @@ extern "C"
 			}
 		}
 		for (std::size_t i = 0; i < plugins.size(); ++i) {
+			SKB_TRACE_DO(trace::emit("plugin_begin", narrow(plugins[i]),
+				trace::Fields().u("index", i).u("of", plugins.size()).s("sha256", reports[i].sha256).s("lineage", reports[i].ok ? reports[i].lineage() : "unknown")));
 			host_one(c, pf, skse, plugins[i], reports[i]);
+			SKB_TRACE_DO(trace::emit("plugin_end", narrow(plugins[i])));
 		}
+		SKB_TRACE_DO(trace::emit("load_phase_end", {}));
 		if (file_exists(game_dir() + L"Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\_session_open.txt")) {
 			DeleteFileW((game_dir() + L"Data\\SKSE\\Plugins\\SKSE-Bridge\\ShadowVM\\_session_open.txt").c_str());  // left by 0.7.0-0.7.2; no longer used
 		}

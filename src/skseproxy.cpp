@@ -31,6 +31,7 @@
 // SKSESerializationInterface), include/SKSE/Interfaces.h:261-267 (Message), interface IDs
 // Interfaces.h:42-52 (kSerialization = 3, kMessaging = 5). [Verified]
 #include "common.h"
+#include "trace.h"
 
 #include <deque>
 
@@ -220,6 +221,11 @@ namespace bridge
 				if (first) {
 					logf("[messaging] delivering message type %u from %s to %s", msg->type, msg->sender ? msg->sender : "?", plugin.c_str());
 				}
+				SKB_TRACE_DO(if (trace::want_flows()) {
+					const std::string snd = msg->sender ? msg->sender : "?";
+					trace::emit_counted("msg", plugin, "fanout|" + snd + "|" + plugin + "|" + std::to_string(msg->type),
+						trace::Fields().s("from", snd).u("type", msg->type).u("len", msg->dataLen).s("route", "skse"));
+				});
 				cb(msg);  // no exception filter: a crash here must stay a crash (the fault log records it)
 			}
 			if (from == "skse" && msg->type == 8) {  // kDataLoaded: most plugins have installed their hooks by now
@@ -266,6 +272,7 @@ namespace bridge
 			logf("[messaging] %s listens to %s%s", plugin.c_str(), sender ? ("\"" + std::string(sender) + "\"").c_str() : "all senders",
 				internal ? " (hosted sender: routed inside the bridge)" :
 				(needReal ? (ok ? " (bridge registered with SKSE)" : " (SKSE REFUSED the registration)") : " (shared bridge registration)"));
+			SKB_TRACE_DO(trace::emit("msg_listen", plugin, trace::Fields().s("sender", sender ? sender : "").b("internal", internal).b("ok", ok)));
 			return ok;
 		}
 
@@ -305,6 +312,10 @@ namespace bridge
 					if (InterlockedIncrement(&logged) <= 32) {
 						logf("[messaging] routing message type %u from %s to %s (inside the bridge)", type, from->plugin.c_str(), plugin.c_str());
 					}
+					SKB_TRACE_DO(if (trace::want_flows()) {
+						trace::emit_counted("msg", plugin, "route|" + from->plugin + "|" + plugin + "|" + std::to_string(type),
+							trace::Fields().s("from", from->plugin).u("type", type).u("len", len).s("route", "internal"));
+					});
 					cb(&msg);
 				}
 			}
@@ -312,6 +323,11 @@ namespace bridge
 				return !targets.empty();  // addressed to a hosted plugin: SKSE cannot deliver it
 			}
 			const bool sent = g_realMsg->Dispatch(g_hostHandle, type, data, len, receiver);
+			SKB_TRACE_DO(if (from && trace::want_flows()) {
+				const std::string rcv = receiver ? receiver : "";
+				trace::emit_counted("msg_out", from->file, "out|" + from->plugin + "|" + rcv + "|" + std::to_string(type),
+					trace::Fields().s("from", from->plugin).s("to", rcv).u("type", type).u("len", len).b("delivered", sent));
+			});
 			return sent || !targets.empty();
 		}
 
@@ -494,12 +510,14 @@ namespace bridge
 				flush_open();
 				g_cur = -1;
 				logf("[cosave] save: %s %s wrote %u record(s)", g_slots[i].plugin.c_str(), fourcc(g_slots[i].uid).c_str(), g_slots[i].saved);
+				SKB_TRACE_DO(trace::emit("cosave", g_slots[i].plugin, trace::Fields().s("phase", "save").s("uid", fourcc(g_slots[i].uid)).u("records", g_slots[i].saved)));
 			}
 			for (const auto& r : g_orphans) {
 				real_write()(r.uid, r.version, r.data.data(), static_cast<std::uint32_t>(r.data.size()));
 			}
 			if (!g_orphans.empty()) {
 				logf("[cosave] save: kept %zu record(s) of hosted plugins not loaded this session", g_orphans.size());
+				SKB_TRACE_DO(trace::emit("cosave", {}, trace::Fields().s("phase", "save_orphans").u("records", g_orphans.size())));
 			}
 		}
 
@@ -547,15 +565,18 @@ namespace bridge
 				g_cur = -1;
 				g_loadHas = false;
 				logf("[cosave] load: %s %s got %zu record(s), read %zu", sl.plugin.c_str(), fourcc(sl.uid).c_str(), g_loadList.size(), g_loadIdx);
+				SKB_TRACE_DO(trace::emit("cosave", sl.plugin, trace::Fields().s("phase", "load").s("uid", fourcc(sl.uid)).u("records", g_loadList.size()).u("read", g_loadIdx)));
 			}
 			g_loadList.clear();
 			if (!g_orphans.empty()) {
 				logf("[cosave] load: %zu record(s) belong to hosted plugins not loaded this session; kept for the next save", g_orphans.size());
+				SKB_TRACE_DO(trace::emit("cosave", {}, trace::Fields().s("phase", "load_orphans").u("records", g_orphans.size())));
 			}
 		}
 
 		void mux_revert_cb(SerializationIface*)
 		{
+			SKB_TRACE_DO(trace::emit("cosave", {}, trace::Fields().s("phase", "revert")));
 			g_orphans.clear();
 			for (std::size_t i = 0; i < g_slots.size(); ++i) {
 				if (g_slots[i].revert) {
@@ -588,6 +609,7 @@ namespace bridge
 			g_realSer->SetFormDeleteCallback(g_hostHandle, reinterpret_cast<void*>(&mux_delete_cb));
 			logf("[cosave] bridge registered co-save %s; hosted plugins get one sub-space each, keyed by their own unique ID",
 				fourcc(kMuxUid).c_str());
+			SKB_TRACE_DO(trace::emit("cosave", {}, trace::Fields().s("phase", "register").s("uid", fourcc(kMuxUid))));
 		}
 
 		Slot& slot_for(const std::string& plugin)
@@ -624,6 +646,7 @@ namespace bridge
 				logf("[cosave] WARNING: %s uses the bridge's own unique ID %s", plugin.c_str(), fourcc(uid).c_str());
 			}
 			slot_for(plugin).uid = uid;
+			SKB_TRACE_DO(trace::emit("cosave", plugin, trace::Fields().s("phase", "claim").s("uid", fourcc(uid))));
 			mux_register();
 		}
 		template <class F>

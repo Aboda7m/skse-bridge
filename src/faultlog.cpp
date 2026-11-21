@@ -11,6 +11,7 @@
 // First-chance means the exception may still be caught later; that is exactly how a plugin can stop
 // working while the game keeps running.
 #include "common.h"
+#include "trace.h"
 
 #include <algorithm>
 
@@ -195,6 +196,12 @@ namespace bridge
 				g_events >= static_cast<LONG>(kMaxEvents)) {
 				return EXCEPTION_CONTINUE_SEARCH;
 			}
+#if SKB_TRACE
+			// The trace build guard-pages its ID-table views and single-steps over each read (trace.cpp); those are not faults.
+			if (trace::enabled() && (code == 0x80000001u || code == EXCEPTION_SINGLE_STEP)) {
+				return EXCEPTION_CONTINUE_SEARCH;
+			}
+#endif
 			t_inside = true;
 			AcquireSRWLockShared(&g_lock);
 
@@ -240,6 +247,9 @@ namespace bridge
 					if (isPoison) {
 						logf("[fault]   %s", poison.c_str());
 					}
+					SKB_TRACE_DO(trace::emit("fault", culprit ? culprit->name : (onStack ? onStack->name : ""),
+						trace::Fields().x("code", code).x("ip", ip).b("inside_plugin", culprit != nullptr).b("from_plugin", onStack != nullptr)
+							.b("missing_id", isPoison).s("detail", isPoison ? poison : std::string())));
 					for (unsigned i = 0; i < n; ++i) {
 						logf("[fault]   #%02u %s", i, where(frames[i]).c_str());
 					}

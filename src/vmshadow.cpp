@@ -18,6 +18,7 @@
 // plugin's layout and logged as such. Instructions whose address the decoder cannot resolve are logged and left to
 // fault (no guessing).
 #include "common.h"
+#include "trace.h"
 
 #include <algorithm>
 #include <cstring>
@@ -83,6 +84,16 @@ namespace bridge
 			std::uint64_t      realOff{ 0 };
 			bool               write{ false };
 			std::uintptr_t     firstRip{ 0 };
+#if SKB_TRACE
+			// TEST-ONLY (trace build): what the flow events need. Filled under g_lock; c/tr indexed [target][write].
+			const char*        cls{ nullptr };
+			std::string        plugin;  // empty = game code
+			bool               layout17{ false };
+			bool               whole{ false };
+			unsigned long long c[3][2]{};
+			unsigned long long tr[3][2]{};
+			std::int64_t       lastQpc{ 0 };
+#endif
 		};
 		std::map<std::pair<std::string, std::uint64_t>, Stat> g_stats;  // (class/module, plugin offset)
 		unsigned                                              g_logged = 0;
@@ -344,6 +355,20 @@ namespace bridge
 				if (first) {
 					st.firstRip = static_cast<std::uintptr_t>(c->Rip);
 				}
+#if SKB_TRACE
+				if (trace::want_flows()) {
+					if (first) {
+						st.cls = k.name;
+						st.plugin = m ? m->name : std::string();
+						st.layout17 = plugin17;
+						st.whole = gameWhole;
+					}
+					LARGE_INTEGER q{};
+					QueryPerformanceCounter(&q);
+					st.lastQpc = q.QuadPart;
+					++st.c[!real ? 1 : (!exists ? 2 : 0)][write ? 1 : 0];
+				}
+#endif
 				const bool doLog = first && g_logged < 400;
 				if (doLog) {
 					++g_logged;
@@ -392,6 +417,7 @@ namespace bridge
 		const auto it = std::lower_bound(gameLib.begin(), gameLib.end(), k.id, [](const IdEntry& e, std::uint64_t v) { return e.id < v; });
 		if (it == gameLib.end() || it->id != k.id) {
 			logf("[shadow] %s: ID %llu not in this game's Address Library; shadow unavailable", k.name, static_cast<unsigned long long>(k.id));
+			SKB_TRACE_DO(trace::emit("shadow_ready", {}, trace::Fields().s("class", k.name).b("ok", false).s("why", "ID not in this game's Address Library")));
 			return false;
 		}
 		g_game17 = game.at_least(1, 7, 99);
@@ -401,6 +427,7 @@ namespace bridge
 		r.base = alloc_near_exe(r.total);
 		if (!r.base) {
 			logf("[shadow] %s: could not reserve memory near the game image; shadow unavailable", k.name);
+			SKB_TRACE_DO(trace::emit("shadow_ready", {}, trace::Fields().s("class", k.name).b("ok", false).s("why", "no memory near the game image")));
 			return false;
 		}
 		r.cell = r.base;
@@ -417,6 +444,8 @@ namespace bridge
 		g_ready = g_ready || r.ready;
 		logf("[shadow] EXPERIMENTAL shadow %s ready: game layout %s, global %p (real global SkyrimSE.exe+0x%llX), shadow %p (+0x%zX)", k.name,
 			g_game17 ? "1.7" : "1.6", static_cast<void*>(r.g), static_cast<unsigned long long>(it->offset), static_cast<void*>(r.s), r.sBytes);
+		SKB_TRACE_DO(trace::emit("shadow_ready", {},
+			trace::Fields().s("class", k.name).b("ok", r.ready).s("game_layout", g_game17 ? "1.7" : "1.6").x("real_global", it->offset).u("bytes", r.sBytes)));
 		return r.ready;
 	}
 
@@ -442,7 +471,50 @@ namespace bridge
 		ReleaseSRWLockExclusive(&g_lock);
 		logf("[shadow] %s uses the shadow(s)%s%s with the %s layout", name.c_str(), (classes & 1) ? " SkyrimVM" : "", (classes & 2) ? " PlayerCharacter" : "",
 			layout17 ? "1.7" : "1.6");
+		SKB_TRACE_DO(trace::emit("shadow_attach", name,
+			trace::Fields().s("classes", std::string((classes & 1) ? "SkyrimVM" : "") + ((classes & 1) && (classes & 2) ? "," : "") + ((classes & 2) ? "PlayerCharacter" : ""))
+				.s("layout", layout17 ? "1.7" : "1.6")));
 	}
+
+#if SKB_TRACE
+	// TEST-ONLY. Called by the trace writer thread: one "vm_access" event per (member, target, read/write) that gained
+	// accesses since the last call. n = total so far, d = new since the previous event for that key.
+	void vm_trace_flush()
+	{
+		if (!g_ready || !trace::want_flows()) {
+			return;
+		}
+		struct Ev
+		{
+			std::string        cls, plugin;
+			bool               layout17, whole, write;
+			int                target;
+			std::uint64_t      off, real;
+			unsigned long long n, d;
+			std::int64_t       qpc;
+		};
+		std::vector<Ev> out;
+		AcquireSRWLockExclusive(&g_lock);
+		for (auto& [key, st] : g_stats) {
+			for (int tg = 0; tg < 3; ++tg) {
+				for (int w = 0; w < 2; ++w) {
+					if (st.c[tg][w] != st.tr[tg][w]) {
+						out.push_back({ st.cls ? st.cls : "", st.plugin, st.layout17, st.whole, w == 1, tg, key.second, st.realOff, st.c[tg][w],
+							st.c[tg][w] - st.tr[tg][w], st.lastQpc });
+						st.tr[tg][w] = st.c[tg][w];
+					}
+				}
+			}
+		}
+		ReleaseSRWLockExclusive(&g_lock);
+		static const char* const kTarget[3] = { "real", "pending", "absent" };  // pending: game object not created yet; absent: member does not exist in this runtime
+		for (const auto& e : out) {
+			trace::emit_at(trace::ms_from_qpc(e.qpc), "vm_access", e.plugin,
+				trace::Fields().s("class", e.cls).b("game", e.plugin.empty()).b("whole", e.whole).x("off", e.off).x("real", e.real).b("write", e.write)
+					.s("layout", e.layout17 ? "1.7" : "1.6").s("target", kTarget[e.target]).u("n", e.n).u("d", e.d));
+		}
+	}
+#endif
 
 	void vm_shadow_report(const char* when)
 	{

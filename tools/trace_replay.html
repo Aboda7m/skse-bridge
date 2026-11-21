@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SKSE-Bridge trace replay</title>
+<style>
+  :root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --dim:#7d8590; --bad:#ff3b3b; --warn:#ffd166; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:10px 12px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { font-size:15px; margin:0 8px 0 0; }
+  button, select, input[type=file]::file-selector-button { background:#21262d; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 12px; cursor:pointer; font:inherit; }
+  button:hover:not(:disabled) { background:#30363d; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.on { background:#1f6feb; border-color:#1f6feb; }
+  .seg { display:inline-flex; gap:0; } .seg > * { border-radius:0; } .seg > :first-child { border-radius:6px 0 0 6px; } .seg > :last-child { border-radius:0 6px 6px 0; }
+  label { color:var(--dim); font-size:12px; }
+  main { display:grid; grid-template-columns: minmax(300px, 1fr) 380px; gap:16px; padding:16px; align-items:start; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  #mapwrap { background:#05070a; border:1px solid var(--line); border-radius:6px; padding:0; line-height:0; }
+  #map { width:100%; height:auto; aspect-ratio:1/1; image-rendering:pixelated; display:block; }
+  #gwrap { background:#05070a; line-height:0; margin:12px 16px; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  #g { width:100%; height:auto; aspect-ratio:16/9; display:block; cursor:pointer; }
+  #gwrap:fullscreen { margin:0; border:0; border-radius:0; display:flex; align-items:center; background:#000; }
+  #gwrap:fullscreen #g { max-height:100vh; }
+  .lane { margin:0 0 14px; }
+  .lane .name { display:flex; justify-content:space-between; font-size:13px; }
+  .bar { height:7px; background:#21262d; border-radius:4px; overflow:hidden; margin-top:4px; }
+  .bar i { display:block; height:100%; width:0; }
+  .counts { color:var(--dim); font-size:11px; margin-top:2px; }
+  #feed { font:12px/1.5 ui-monospace, Consolas, monospace; margin-top:8px; min-height:15em; white-space:pre; overflow:hidden; }
+  #feed .bad { color:var(--bad); } #feed .warn { color:var(--warn); }
+  #clock, #recstat { color:var(--dim); font-size:12px; }
+  #recstat.rec { color:#ff6b6b; }
+  #empty { padding:60px 16px; text-align:center; color:var(--dim); }
+  input[type=range] { accent-color:#4cc9f0; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SKSE-Bridge trace replay</h1>
+  <input id="files" type="file" multiple accept=".jsonl,.csv,.json" title="Pick SKSE-Bridge-trace.jsonl (and, optionally, the SKSE-Bridge-trace-table-*.csv files next to it)">
+  <span class="seg"><button id="vgraph" class="on" disabled>Graph</button><button id="vmap" disabled>ID map</button></span>
+  <button id="play" disabled>Play</button>
+  <button id="restart" disabled>Restart</button>
+  <label>Speed <input id="speed" type="range" min="0.25" max="8" step="0.25" value="1" style="width:110px"> <span id="speedv">1x</span></label>
+  <label>Position <input id="seek" type="range" min="0" max="1000" value="0" style="width:200px" disabled></label>
+  <label id="focuslab">Focus <select id="focus" disabled><option value="">all plugins</option></select></label>
+  <button id="full" title="Fullscreen is handy for screen-recording a video">Fullscreen</button>
+  <span class="seg" id="recbox" title="Records the graph canvas straight to a .webm file (real time, no screen recorder needed)">
+    <select id="recsize"><option value="1280x720">720p</option><option value="1920x1080" selected>1080p</option><option value="2560x1440">1440p</option></select>
+    <button id="rec" disabled>Record video</button>
+  </span>
+  <span id="clock"></span><span id="recstat"></span>
+</header>
+<div id="empty">Choose <b>SKSE-Bridge-trace.jsonl</b> from the game's SKSE log folder<br>(add the <code>SKSE-Bridge-trace-table-*.csv</code> files to colour missing / remapped IDs).</div>
+<div id="graphView" hidden><div id="gwrap"><canvas id="g" width="1920" height="1080"></canvas></div></div>
+<main id="app" hidden>
+  <div id="mapwrap"><canvas id="map"></canvas></div>
+  <aside>
+    <div id="lanes"></div>
+    <div style="color:var(--dim);font-size:12px">latest lookups</div>
+    <div id="feed"></div>
+  </aside>
+</main>
+<script>
+"use strict";
+const PALETTE = ["#4cc9f0", "#f72585", "#b8f35c", "#ffb703", "#9b5de5", "#00f5d4", "#ff6d00", "#c8b6ff"];
+const GAP_CAP_MS = 250;          // ID map: idle gaps in the trace longer than this are squeezed to it
+const GRAPH_GAP_CAP_MS = 400;    // graph: same idea
+const BASE_SECONDS = 30;         // length of the replay at 1x
+const $ = id => document.getElementById(id);
+const hex2rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const norm = n => String(n || "").toLowerCase().replace(/\.dll$/, "");
+const fmt = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e4 ? (n / 1e3).toFixed(1) + "k" : String(n);
+
+let S = null;                    // ID-map session
+let GM = null;                   // graph model + runtime state
+let view = "graph";
+let playing = false, now = 0, last = 0;
+let rec = null;                  // active video recording
+
+// ======================================================================= loading
+$("files").addEventListener("change", async e => {
+  const files = [...e.target.files];
+  const jf = files.find(f => /\.jsonl?$/i.test(f.name));
+  if (!jf) return;
+  const events = [];
+  for (const line of (await jf.text()).split("\n")) {
+    if (!line.trim()) continue;
+    try { events.push(JSON.parse(line)); } catch (_) { /* truncated last line */ }
+  }
+  const tables = {};
+  for (const f of files.filter(f => /\.csv$/i.test(f.name))) {
+    const plugin = f.name.replace(/^SKSE-Bridge-trace-table-/, "").replace(/\.csv$/i, "");
+    const m = new Map();
+    for (const row of (await f.text()).split("\n").slice(1)) {
+      const c = row.split(",");
+      if (c.length >= 4) m.set(+c[0], c[3].trim());
+    }
+    tables[plugin] = m;
+  }
+  load(events, tables);
+});
+
+function inferLookups(events, tables) {
+  // infer lookups: first probe of every lookup is the plugin's most frequent probe entry
+  const probes = events.filter(e => e.ev === "probe");
+  const freq = {};
+  for (const p of probes) { const m = freq[p.plugin] || (freq[p.plugin] = new Map()); m.set(p.entry, (m.get(p.entry) || 0) + 1); }
+  const first = {};
+  for (const [pl, m] of Object.entries(freq)) first[pl] = [...m.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  const lookups = [], open = new Map();
+  const flush = key => {
+    const c = open.get(key); if (!c) return; open.delete(key);
+    const l = c[c.length - 1], pl = l.plugin, tab = tables[pl];
+    lookups.push({ t: l.t, plugin: pl, id: l.id, status: tab ? (tab.get(l.id) || "translated") : "unknown" });
+  };
+  for (const p of probes) {
+    const key = p.plugin + "|" + (p.tid || 0);
+    if (p.entry === first[p.plugin]) flush(key);
+    if (!open.has(key)) open.set(key, []);
+    open.get(key).push(p);
+  }
+  for (const k of [...open.keys()]) flush(k);
+  lookups.sort((a, b) => a.t - b.t);
+  return lookups;
+}
+
+function load(events, tables) {
+  events.sort((a, b) => (a.t - b.t) || (a.seq - b.seq));
+  const lookups = inferLookups(events, tables);
+  const flowEvs = events.filter(e => e.ev !== "probe" && e.ev !== "heartbeat");
+  if (!lookups.length && !flowEvs.length) { alert("This trace has no events to show."); return; }
+  const plugins = [];
+  for (const e of events) if (e.plugin && !plugins.includes(e.plugin)) plugins.push(e.plugin);
+  S = lookups.length ? buildMap(lookups, plugins) : null;
+  GM = buildGraph(events, lookups, tables);
+  snapLayout(GM);
+  const sel = $("focus"); sel.innerHTML = '<option value="">all plugins</option>';
+  for (const k of GM.plugins) sel.insertAdjacentHTML("beforeend", `<option value="${k}">${GM.nodes.get(k).label}</option>`);
+  sel.disabled = false;
+  $("empty").hidden = true;
+  for (const id of ["play", "restart", "seek", "vgraph", "rec"]) $(id).disabled = false;
+  $("vmap").disabled = !S;
+  showView(GM.items.length ? "graph" : "map");
+  restartAll(); setPlaying(true);
+}
+
+function showView(v) {
+  view = v;
+  $("graphView").hidden = v !== "graph";
+  $("app").hidden = v !== "map";
+  $("vgraph").classList.toggle("on", v === "graph"); $("vmap").classList.toggle("on", v === "map");
+  $("focuslab").hidden = v !== "graph"; $("recbox").hidden = v !== "graph";
+  redraw();
+}
+$("vgraph").onclick = () => showView("graph");
+$("vmap").onclick = () => { if (S) showView("map"); };
+
+// ======================================================================= ID map (one pixel per ID)
+function buildMap(lookups, plugins) {
+  const times = [...new Set(lookups.map(l => l.t))].sort((a, b) => a - b);
+  const warp = new Map(); let acc = 0;
+  times.forEach((t, i) => { if (i) acc += Math.min(t - times[i - 1], GAP_CAP_MS); warp.set(t, acc); });
+  lookups.forEach(l => l.w = warp.get(l.t));
+  const total = Math.max(acc, 1);
+  const maxId = lookups.reduce((m, l) => Math.max(m, l.id), 0);
+  const side = Math.ceil(Math.sqrt(maxId + 1));
+  const cv = $("map"); cv.width = side; cv.height = side;
+  const ctx = cv.getContext("2d");
+  const img = ctx.createImageData(side, side);
+  const colors = Object.fromEntries(plugins.map((p, i) => [p, hex2rgb(PALETTE[i % PALETTE.length])]));
+  const per = {}; lookups.forEach(l => per[l.plugin] = (per[l.plugin] || 0) + 1);
+  $("lanes").innerHTML = "";
+  const lanes = {};
+  plugins.filter(p => per[p]).forEach(p => {
+    const d = document.createElement("div"); d.className = "lane";
+    d.innerHTML = `<div class="name"><span style="color:${PALETTE[plugins.indexOf(p) % PALETTE.length]}">${p}</span><span class="n">0</span></div>
+      <div class="bar"><i style="background:${PALETTE[plugins.indexOf(p) % PALETTE.length]}"></i></div><div class="counts"></div>`;
+    $("lanes").appendChild(d);
+    lanes[p] = { n: d.querySelector(".n"), bar: d.querySelector("i"), counts: d.querySelector(".counts"), done: 0, st: {} };
+  });
+  return { lookups, total, side, ctx, img, colors, per, lanes, idx: 0, seen: new Uint8ClampedArray(side * side * 3), glow: new Float32Array(side * side),
+           gcol: new Uint8ClampedArray(side * side * 3), feed: [], trace: lookups.map(l => l.t) };
+}
+
+function mapRestart() {
+  if (!S) return;
+  S.idx = 0; S.seen.fill(0); S.glow.fill(0); S.gcol.fill(0); S.feed = []; now = 0;
+  for (const l of Object.values(S.lanes)) { l.done = 0; l.st = {}; l.n.textContent = "0"; l.bar.style.width = "0"; l.counts.textContent = ""; }
+}
+
+function mapAdvance() {
+  const { lookups, seen, glow, gcol, colors } = S;
+  while (S.idx < lookups.length && lookups[S.idx].w <= now) {
+    const l = lookups[S.idx++], L = S.lanes[l.plugin], i = l.id;
+    const c = l.status === "missing" ? [255, 59, 59] : l.status === "remapped" ? [255, 209, 102] : colors[l.plugin];
+    const k = (l.status === "missing" || l.status === "remapped") ? 1 : 0.8;
+    seen[i * 3] = c[0] * k; seen[i * 3 + 1] = c[1] * k; seen[i * 3 + 2] = c[2] * k;
+    glow[i] = 1; gcol[i * 3] = c[0]; gcol[i * 3 + 1] = c[1]; gcol[i * 3 + 2] = c[2];
+    L.done++; L.st[l.status] = (L.st[l.status] || 0) + 1;
+    S.feed.unshift(`${l.plugin.slice(0, 22).padEnd(22)} ${String(i).padStart(7)}  ${l.status === "missing" ? "MISSING" : l.status === "remapped" ? "remapped" : "ok"}`
+      + (l.status === "missing" ? "|bad" : l.status === "remapped" ? "|warn" : ""));
+    if (S.feed.length > 12) S.feed.pop();
+  }
+}
+
+function mapDraw() {
+  const { img, ctx, seen, glow, gcol, side } = S, d = img.data;
+  d.fill(0);
+  const put = (p, r, g, b) => { const o = p * 4; if (d[o] < r || d[o + 1] < g || d[o + 2] < b) { d[o] = Math.max(d[o], r); d[o + 1] = Math.max(d[o + 1], g); d[o + 2] = Math.max(d[o + 2], b); d[o + 3] = 255; } };
+  for (let i = 0; i < glow.length; i++) {
+    let r = seen[i * 3], g = seen[i * 3 + 1], b = seen[i * 3 + 2];
+    const gl = glow[i];
+    if (gl > 0.01) { r = Math.max(r, gcol[i * 3] * gl) + gl ** 3 * 90; g = Math.max(g, gcol[i * 3 + 1] * gl) + gl ** 3 * 90; b = Math.max(b, gcol[i * 3 + 2] * gl) + gl ** 3 * 90; glow[i] = gl * 0.93; }
+    if (r || g || b) { put(i, r, g, b); if ((i % side) < side - 1) put(i + 1, r, g, b); if (i + side < glow.length) { put(i + side, r, g, b); if ((i % side) < side - 1) put(i + side + 1, r, g, b); } }
+  }
+  for (let i = 3; i < d.length; i += 4) if (!d[i]) d[i] = 255;
+  ctx.putImageData(img, 0, 0);
+  for (const [p, L] of Object.entries(S.lanes)) {
+    L.n.textContent = L.done; L.bar.style.width = (100 * L.done / S.per[p]) + "%";
+    L.counts.textContent = Object.entries(L.st).map(([k, v]) => k + " " + v).join("   ");
+  }
+  $("feed").innerHTML = S.feed.map(s => { const [t, c] = s.split("|"); return `<div class="${c || ""}">${t.replace(/</g, "&lt;")}</div>`; }).join("");
+  const tms = S.idx ? S.trace[S.idx - 1] : 0;
+  $("clock").textContent = `trace time ${(tms / 1000).toFixed(2)} s`;
+  $("seek").value = Math.round(1000 * Math.min(1, now / S.total));
+}
+
+// ======================================================================= node graph
+// Every beam is one logged event (or a batch of them: counters stay exact, at most 5 beams are drawn per batch).
+// Nothing is drawn for what happens inside a plugin's own code: the bridge cannot see that.
+const LW = 1920, LH = 1080;      // logical canvas; the real canvas is scaled to the chosen video size
+const COL = { translated: "#3ddc84", remapped: "#ffd166", missing: "#ff3b3b", unknown: "#8aa4ff",
+  read: "#22d3ee", write: "#ff4fd8", dummy: "#8b95a5", msg: "#b388ff", cosave: "#f4a261", table: "#d0d7de",
+  ok: "#4cc9f0", warned: "#ffd166", unsafe: "#ff9f1c", blocked: "#ff3b3b", fault: "#ff3b3b" };
+const HUBS = {
+  skse:      { label: "SKSE",                  sub: "messaging host",          w: 190, h: 74 },
+  bridge:    { label: "SKSE-Bridge",           sub: "",                        w: 0,   h: 0, r: 74 },
+  idtable:   { label: "Address Library table", sub: "",                        w: 290, h: 96 },
+  shadowvm:  { label: "Shadow VM",             sub: "bridge-owned shadow",     w: 250, h: 96 },
+  gamevm:    { label: "Real game objects",     sub: "SkyrimVM / PlayerCharacter", w: 270, h: 96 },
+  gameexe:   { label: "Game code (exe)",       sub: "patches & hooks",         w: 270, h: 96 },
+  cosave:    { label: "Co-save",               sub: "multiplexed by the bridge", w: 250, h: 82 },
+  life:      { label: "Load sequence",         sub: "",                        w: 330, h: 250 },
+};
+
+function layoutTargets(M) {
+  const t = {}, pl = M.plugins, n = pl.length, f = M.focus;
+  const far = { x: -400, y: -400 };
+  if (!f) {
+    Object.assign(t, { bridge: { x: 870, y: 540 }, skse: { x: 870, y: 110 }, cosave: { x: 870, y: 975 }, idtable: { x: 1370, y: 215 },
+      shadowvm: { x: 1370, y: 490 }, gamevm: { x: 1745, y: 490 }, gameexe: { x: 1370, y: 800 }, life: far });
+    const cols = n > 9 ? 2 : 1, rows = Math.ceil(n / cols);
+    pl.forEach((k, i) => {
+      const col = i % cols, row = Math.floor(i / cols);
+      t[k] = { x: cols > 1 ? (col ? 560 : 330) : 480, y: rows > 1 ? 130 + (row + (col ? 0.5 : 0)) * (820 / rows) : 540, s: cols > 1 ? 0.65 : 1 };
+    });
+  } else {
+    Object.assign(t, { bridge: { x: 880, y: 250 }, skse: { x: 560, y: 120 }, cosave: { x: 880, y: 975 }, idtable: { x: 1380, y: 255 },
+      shadowvm: { x: 1380, y: 540 }, gamevm: { x: 1740, y: 540 }, gameexe: { x: 1380, y: 840 }, life: { x: 270, y: 640 } });
+    const others = pl.filter(k => k !== f);
+    others.forEach((k, i) => { t[k] = { x: 640 + (i % 6) * 150 - Math.min(others.length, 6) * 0 , y: 1020 - Math.floor(i / 6) * 70, s: 0.55 }; });
+    t[f] = { x: 880, y: 590, s: 1.6 };
+  }
+  return t;
+}
+
+function buildGraph(events, lookups, tables) {
+  const nodes = new Map(), plugins = [], items = [], meta = { version: "", game: "", translate: null };
+  const mkNode = (key, o) => nodes.set(key, Object.assign({ key, x: -400, y: -400, tx: -400, ty: -400, sc: 1, fl: 0, flc: "#fff", alpha: 1 }, o));
+  for (const k of Object.keys(HUBS)) mkNode(k, { kind: "hub", label: HUBS[k].label, sub: HUBS[k].sub, hub: HUBS[k] });
+  const ensure = name => {
+    const k = norm(name);
+    if (!nodes.has(k)) { mkNode(k, { kind: "plugin", label: String(name).replace(/\.dll$/i, ""), color: PALETTE[plugins.length % PALETTE.length] }); plugins.push(k); }
+    return k;
+  };
+  for (const e of events) {
+    if (e.plugin) ensure(e.plugin);
+    if ((e.ev === "msg" || e.ev === "msg_out") && e.from && norm(e.from) !== "skse") ensure(e.from);
+  }
+  for (const l of lookups) ensure(l.plugin);
+
+  const add = (t, f) => items.push({ t, f });
+  const when = e => `${(e.t / 1000).toFixed(2)}`;
+  const trunc = (s, n) => { s = String(s || ""); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
+  const feedLine = (M, e, text, color, keys) => { M.feed.push({ t: e.t, text, color, keys }); if (M.feed.length > 60) M.feed.shift(); };
+  const once = (M, key) => { if (M.seen.has(key)) return false; M.seen.add(key); return true; };
+  const pn = (M, name) => { const n = M.nodes.get(norm(name)); if (n && n.state === "idle") n.state = "appear"; return n; };
+  const batch = (e) => Math.max(1, Math.min(5, e.d || 1));
+
+  // ---- lookups (inferred from probes) ----
+  for (const l of lookups) {
+    const k = norm(l.plugin);
+    add(l.t, (M, silent) => {
+      const n = pn(M, l.plugin); n.st.lk++;
+      const h = M.hub.idtable; h[l.status === "missing" ? "ms" : l.status === "remapped" ? "rm" : l.status === "translated" ? "tr" : "un"]++;
+      if (l.status === "missing") n.st.ms++;
+      if (!silent) spawn(M, [k, "idtable"], COL[l.status] || COL.unknown, { dur: 520, w: l.status === "translated" || l.status === "unknown" ? 0.7 : 1.1, style: "lookup" });
+    });
+  }
+
+  for (const e of events) {
+    const k = e.plugin ? norm(e.plugin) : null;
+    switch (e.ev) {
+      case "run_start": add(e.t, (M) => { M.meta.game = e.game_version || ""; }); break;
+      case "host": add(e.t, (M) => { M.meta.version = e.version || ""; M.meta.translate = e.translate; }); break;
+      case "plugin_begin":
+        add(e.t, (M) => { const n = pn(M, e.plugin); n.state = "appear"; n.life.begin = e.t; n.life.lineage = e.lineage;
+          feedLine(M, e, `${trunc(e.plugin, 26)} begins (${e.index + 1}/${e.of})`, null, [k]); });
+        break;
+      case "plan":
+        add(e.t, (M) => { const n = pn(M, e.plugin); n.life.plan = `${e.target || "?"}${e.translate ? " (translated)" : " (native)"}`;
+          feedLine(M, e, `${trunc(e.plugin, 26)} plan: ${e.target}${e.translate ? " translated" : " native"}`, null, [k]); });
+        break;
+      case "table":
+        add(e.t, (M) => { const n = pn(M, e.plugin); n.life.table = { rows: e.rows, tr: e.translated, rm: e.remapped, ms: e.missing };
+          n.st.tbl = { tr: e.translated, rm: e.remapped, ms: e.missing };
+          feedLine(M, e, `${trunc(e.plugin, 26)} table: ${fmt(e.rows)} rows, ${fmt(e.missing)} missing, ${fmt(e.remapped)} remapped`, null, [k]); });
+        break;
+      case "table_open":
+        add(e.t, (M, silent) => { const n = pn(M, e.plugin); n.life.open = true;
+          if (!silent) spawn(M, ["idtable", k], COL.table, { dur: 700, w: 1.5 });
+          feedLine(M, e, `${trunc(e.plugin, 26)} is handed its table`, null, [k]); });
+        break;
+      case "table_view":
+        add(e.t, (M) => { const n = pn(M, e.plugin); n.life.view = e.armed ? "armed" : "not armed";
+          feedLine(M, e, `${trunc(e.plugin, 26)} table view ${e.armed ? "armed (lookups traced)" : "NOT armed: " + trunc(e.why, 40)}`, e.armed ? null : COL.warned, [k]); });
+        break;
+      case "dll_loaded":
+        add(e.t, (M) => { const n = pn(M, e.plugin); n.life.dll = e.ok ? "ok" : "failed"; flash(n, e.ok ? "#ffffff" : COL.fault);
+          feedLine(M, e, `${trunc(e.plugin, 26)} ${e.ok ? "DLL loaded" : "DLL FAILED to load"}`, e.ok ? null : COL.fault, [k]); });
+        break;
+      case "skse_load_begin":
+        add(e.t, (M) => { const n = pn(M, e.plugin); n.state = "loading"; n.life.load = "running";
+          feedLine(M, e, `${trunc(e.plugin, 26)} SKSE load begins`, null, [k]); });
+        break;
+      case "skse_load_end":
+        add(e.t, (M) => { const n = pn(M, e.plugin); n.state = "appear"; n.life.load = e.returned && e.result ? "ok" : "failed";
+          flash(n, n.life.load === "ok" ? COL.translated : COL.fault);
+          feedLine(M, e, `${trunc(e.plugin, 26)} SKSE load ${n.life.load === "ok" ? "returned ok" : "FAILED"}`, n.life.load === "ok" ? null : COL.fault, [k]); });
+        break;
+      case "plugin_end":
+        add(e.t, (M) => { const n = pn(M, e.plugin); n.state = "done"; n.life.end = e.t; });
+        break;
+      case "load_phase_end":
+        add(e.t, (M) => feedLine(M, e, "all plugins loaded", null, []));
+        break;
+      case "patch":
+        add(e.t, (M, silent) => {
+          const n = pn(M, e.plugin), v = e.verdict || "ok", h = M.hub.gameexe;
+          n.st.pat++; h[v === "blocked" ? "bl" : v === "unsafe" ? "un" : v === "warned" ? "wa" : "ok"]++;
+          if (!silent) spawn(M, [k, "bridge", "gameexe"], COL[v] || COL.ok, { dur: 900, w: 1.6, end: v === "blocked" ? "block" : "arrive", stopAt: v === "blocked" ? 1 : 0 });
+          feedLine(M, e, `${trunc(e.plugin, 22)} patch ${v}: ${trunc(e.where, 34)}`, v === "blocked" || v === "unsafe" ? COL.blocked : v === "warned" ? COL.warned : null, [k]);
+        });
+        break;
+      case "fault":
+        add(e.t, (M, silent) => {
+          const n = e.plugin ? pn(M, e.plugin) : null;
+          if (n) { n.fault = 1; flash(n, COL.fault); }
+          if (n && e.missing_id && !silent) spawn(M, ["idtable", k], COL.missing, { dur: 800, w: 2, end: "block" });
+          feedLine(M, e, `FAULT ${e.missing_id ? "missing ID " : ""}${trunc(e.detail || e.code, 52)}`, COL.fault, [k]);
+        });
+        break;
+      case "shadow_ready":
+        add(e.t, (M) => { M.hub.shadowvm.ready[e.class] = e.ok; feedLine(M, e, `shadow ${e.class} ${e.ok ? "ready (game layout " + (e.game_layout || "?") + ")" : "unavailable: " + trunc(e.why, 40)}`, e.ok ? null : COL.warned, []); });
+        break;
+      case "shadow_attach":
+        add(e.t, (M) => { const n = pn(M, e.plugin); n.life.shadow = e.classes; declare(M, k, "shadowvm");
+          feedLine(M, e, `${trunc(e.plugin, 24)} uses shadow ${e.classes} (${e.layout} layout)`, null, [k]); });
+        break;
+      case "vm_access": {
+        const src = e.game || !e.plugin ? "gameexe" : k;
+        add(e.t, (M, silent) => {
+          const d = e.d || 1, tg = e.target || "real", h = M.hub.shadowvm;
+          const n = e.plugin ? pn(M, e.plugin) : null;
+          if (n) n.st[e.write ? "vmw" : "vmr"] += d;
+          h[e.write ? "w" : "r"] += d;
+          if (tg === "real") M.hub.gamevm.n += d; else h.dummy += d;
+          if (!silent) {
+            const via = tg === "real" ? [src, "shadowvm", "gamevm"] : [src, "shadowvm"];
+            const color = tg !== "real" ? COL.dummy : e.write ? COL.write : COL.read;
+            for (let i = 0; i < batch(e); i++) spawn(M, via, color, { dur: 640, delay: i * 70, w: 1, end: tg === "real" ? "arrive" : "dummy", ret: tg === "real" && !e.write, style: "vm" });
+          }
+          if (once(M, `vm|${src}|${e.class}|${e.off}|${e.write}|${tg}`))
+            feedLine(M, e, `${src === "gameexe" ? "game code" : trunc(e.plugin, 20)} ${e.write ? "writes" : "reads"} ${e.class}+${e.off} -> ${tg === "real" ? "real " + e.real : "dummy (" + (tg === "pending" ? "object not created yet" : "no such member") + ")"}`,
+              tg === "real" ? null : COL.dummy, [k]);
+        });
+        break;
+      }
+      case "msg_listen":
+        add(e.t, (M) => { pn(M, e.plugin); declare(M, k, "bridge");
+          feedLine(M, e, `${trunc(e.plugin, 24)} listens to ${e.sender || "all senders"}${e.internal ? " (routed inside the bridge)" : ""}${e.ok === false ? " - REFUSED" : ""}`, e.ok === false ? COL.warned : null, [k]); });
+        break;
+      case "msg": {
+        const internal = e.route === "internal";
+        const from = internal ? norm(e.from) : "skse";
+        add(e.t, (M, silent) => {
+          const d = e.d || 1; pn(M, e.plugin).st.msg += d; M.hub.bridge.msgs += d; if (!internal) M.hub.skse.in += d;
+          if (!silent) for (let i = 0; i < batch(e); i++) spawn(M, [from, "bridge", k], COL.msg, { dur: 720, delay: i * 90, w: 1.1, style: "msg" });
+          if (once(M, `msg|${from}|${k}|${e.type}`)) feedLine(M, e, `msg type ${e.type}: ${trunc(e.from, 20)} -> ${trunc(e.plugin, 22)}`, null, [k, from]);
+        });
+        break;
+      }
+      case "msg_out":
+        add(e.t, (M, silent) => {
+          const d = e.d || 1; pn(M, e.plugin).st.msg += d; M.hub.skse.out += d;
+          if (!silent) for (let i = 0; i < batch(e); i++) spawn(M, [k, "bridge", "skse"], COL.msg, { dur: 720, delay: i * 90, w: 1.1, style: "msg" });
+          if (once(M, `out|${k}|${e.to}|${e.type}`)) feedLine(M, e, `msg type ${e.type}: ${trunc(e.plugin, 22)} -> ${e.to || "SKSE (all)"}${e.delivered === false ? " (not delivered)" : ""}`, null, [k]);
+        });
+        break;
+      case "cosave": {
+        const ph = e.phase;
+        add(e.t, (M, silent) => {
+          const h = M.hub.cosave, n = e.plugin ? pn(M, e.plugin) : null;
+          const r = e.records || 0;
+          if (ph === "register") feedLine(M, e, `co-save slot ${e.uid} registered by the bridge`, null, []);
+          else if (ph === "claim") { declare(M, k, "cosave"); feedLine(M, e, `${trunc(e.plugin, 24)} claims co-save ID ${e.uid}`, null, [k]); }
+          else if (ph === "save" || ph === "load") {
+            h[ph === "save" ? "sv" : "ld"] += r; if (n) n.st.cs += r;
+            if (!silent) for (let i = 0; i < Math.max(1, Math.min(4, r)); i++)
+              spawn(M, ph === "save" ? [k, "bridge", "cosave"] : ["cosave", "bridge", k], COL.cosave, { dur: 760, delay: i * 110, w: 1.2, style: "msg" });
+            feedLine(M, e, `co-save ${ph}: ${trunc(e.plugin, 22)} ${r} record(s)`, null, [k]);
+          } else if (ph === "save_orphans" || ph === "load_orphans") {
+            flash(M.nodes.get("cosave"), COL.cosave); feedLine(M, e, `co-save ${ph === "save_orphans" ? "kept" : "found"} ${r} record(s) of plugins not loaded`, COL.warned, []);
+          } else if (ph === "revert") { flash(M.nodes.get("cosave"), COL.cosave); feedLine(M, e, "co-save revert", null, []); }
+        });
+        break;
+      }
+    }
+  }
+
+  // ---- warp time so idle gaps are short, then scale to BASE_SECONDS ----
+  items.sort((a, b) => a.t - b.t);
+  let acc = 0, prev = null;
+  for (const it of items) { if (prev !== null) acc += Math.min(it.t - prev, GRAPH_GAP_CAP_MS); prev = it.t; it.w = acc; }
+  const total = Math.max(acc, 1), k = BASE_SECONDS * 1000 / total;
+  for (const it of items) it.pw = it.w * k;
+  const M = { nodes, plugins, items, meta, total: BASE_SECONDS * 1000, focus: "" };
+  resetRuntime(M);
+  return M;
+}
+
+function newNodeState(n) {
+  Object.assign(n, { state: "idle", fault: 0, fl: 0, st: { lk: 0, ms: 0, vmr: 0, vmw: 0, msg: 0, pat: 0, cs: 0 }, life: {} });
+}
+
+function resetRuntime(M) {
+  for (const n of M.nodes.values()) if (n.kind === "plugin") newNodeState(n);
+  M.P = 0; M.W = 0; M.idx = 0; M.beams = []; M.bursts = []; M.edges = new Map(); M.feed = []; M.seen = new Set();
+  M.hub = { idtable: { tr: 0, rm: 0, ms: 0, un: 0 }, shadowvm: { r: 0, w: 0, dummy: 0, ready: {} }, gamevm: { n: 0 }, gameexe: { ok: 0, wa: 0, un: 0, bl: 0 },
+            cosave: { sv: 0, ld: 0 }, skse: { in: 0, out: 0 }, bridge: { msgs: 0 } };
+  M.meta.version = M.meta.version || ""; M.endedAt = null;
+}
+
+function flash(n, c) { if (n) { n.fl = 1; n.flc = c; } }
+function edgeKey(a, b) { return a < b ? a + "|" + b : b + "|" + a; }
+function edgeOf(M, a, b) { const k = edgeKey(a, b); let e = M.edges.get(k); if (!e) M.edges.set(k, e = { a, b, h: 0, decl: false }); return e; }
+function declare(M, a, b) { edgeOf(M, a, b).decl = true; }
+
+function spawn(M, via, color, o) {
+  if (o.style === "lookup" && M.beams.length > 420) return;
+  if (via.some(k => !M.nodes.has(k))) return;
+  M.beams.push({ via, color, born: M.W + (o.delay || 0), dur: o.dur || 600, w: o.w || 1, end: o.end || "arrive", ret: !!o.ret, style: o.style || "ev", stopAt: o.stopAt || 0 });
+  for (let i = 0; i + 1 < via.length; i++) { const e = edgeOf(M, via[i], via[i + 1]); e.h = Math.min(1, e.h + 0.12); }
+}
+
+function fireTo(M, silent) {
+  while (M.idx < M.items.length && M.items[M.idx].pw <= M.P) M.items[M.idx++].f(M, silent);
+}
+
+function snapLayout(M) {
+  const tg = layoutTargets(M);
+  for (const [k, n] of M.nodes) { const t = tg[k]; if (t) { n.x = n.tx = t.x; n.y = n.ty = t.y; n.sc = n.ts = t.s || 1; } }
+}
+function gRestart() { if (!GM) return; resetRuntime(GM); snapLayout(GM); }
+function restartAll() { mapRestart(); gRestart(); redraw(); }
+
+function gSeek(frac) {
+  const M = GM; resetRuntime(M);
+  M.P = frac * M.total; fireTo(M, true); M.W = 0;
+}
+
+function gAdvance(dtWall) {
+  const M = GM;
+  M.P += dtWall * +$("speed").value;
+  fireTo(M, false);
+  M.W += dtWall * Math.min(+$("speed").value, 2);
+}
+
+function gDraw(ctx, scale) {
+  const M = GM, W = M.W;
+  const tg = layoutTargets(M);
+  for (const [k, n] of M.nodes) {
+    const t = tg[k]; if (!t) continue;
+    n.tx = t.x; n.ty = t.y; n.ts = t.s || 1;
+    const a = 1 - Math.exp(-0.18);   // per-frame ease; frames are ~16 ms, so this is a smooth ~0.4 s glide
+    n.x += (n.tx - n.x) * a; n.y += (n.ty - n.y) * a; n.sc += (n.ts - n.sc) * a;
+  }
+  const f = M.focus;
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.globalCompositeOperation = "source-over"; ctx.globalAlpha = 1;
+  ctx.fillStyle = "#05070a"; ctx.fillRect(0, 0, LW, LH);
+
+  // edges
+  ctx.lineCap = "round";
+  for (const e of M.edges.values()) {
+    const A = M.nodes.get(e.a), B = M.nodes.get(e.b);
+    e.h *= 0.985;
+    const dim = f && e.a !== f && e.b !== f && e.a !== "bridge" && e.b !== "bridge" ? 0.25 : f && e.a !== f && e.b !== f ? 0.25 : 1;
+    if (!e.decl && e.h < 0.02) continue;
+    ctx.strokeStyle = "#8da2c0"; ctx.globalAlpha = (0.10 + 0.5 * e.h) * dim; ctx.lineWidth = 1.5 + 3 * e.h;
+    ctx.setLineDash(e.decl && e.h < 0.05 ? [8, 10] : []);
+    ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+  }
+  ctx.setLineDash([]); ctx.globalAlpha = 1;
+
+  // beams
+  ctx.globalCompositeOperation = "lighter";
+  const keep = [];
+  for (const b of M.beams) {
+    if (W < b.born) { keep.push(b); continue; }
+    const p = (W - b.born) / b.dur;
+    const pts = b.via.map(k => M.nodes.get(k));
+    if (p >= 1) { arrive(M, b, pts); if (b.ret) spawnReturn(M, b); continue; }
+    keep.push(b);
+    const dimmed = f && !b.via.includes(f);
+    ctx.globalAlpha = dimmed ? 0.12 : 1;
+    drawBeam(ctx, pts, b, p < 0.5 ? 2 * p * p : 1 - 2 * (1 - p) * (1 - p));
+  }
+  M.beams = keep;
+  ctx.globalAlpha = 1;
+
+  // bursts + nodes
+  ctx.globalCompositeOperation = "source-over";
+  M.bursts = M.bursts.filter(u => (u.age += 0.03) < 1);
+  for (const u of M.bursts) {
+    ctx.globalAlpha = 1 - u.age; ctx.strokeStyle = u.color; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(u.x, u.y, 14 + 46 * u.age, 0, 7); ctx.stroke();
+    if (u.cross) { ctx.beginPath(); ctx.moveTo(u.x - 14, u.y - 14); ctx.lineTo(u.x + 14, u.y + 14); ctx.moveTo(u.x + 14, u.y - 14); ctx.lineTo(u.x - 14, u.y + 14); ctx.stroke(); }
+  }
+  ctx.globalAlpha = 1;
+  for (const n of M.nodes.values()) { if (n.kind === "plugin") drawPlugin(ctx, M, n); else drawHub(ctx, M, n); }
+  drawHud(ctx, M);
+}
+
+function pathLen(pts) { let L = 0; const seg = []; for (let i = 0; i + 1 < pts.length; i++) { const d = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y); seg.push(d); L += d; } return { L, seg }; }
+function pointAlong(pts, pl, u) {
+  let d = Math.max(0, Math.min(1, u)) * pl.L;
+  for (let i = 0; i < pl.seg.length; i++) {
+    if (d <= pl.seg[i] || i === pl.seg.length - 1) { const t = pl.seg[i] ? d / pl.seg[i] : 0; return { x: pts[i].x + (pts[i + 1].x - pts[i].x) * t, y: pts[i].y + (pts[i + 1].y - pts[i].y) * t }; }
+    d -= pl.seg[i];
+  }
+  return { x: pts[0].x, y: pts[0].y };
+}
+function drawBeam(ctx, pts, b, u) {
+  const pl = pathLen(pts); if (pl.L < 1) return;
+  let end = 1;
+  if (b.stopAt && b.end === "block") { let acc = 0; for (let i = 0; i < b.stopAt && i < pl.seg.length; i++) acc += pl.seg[i]; end = acc / pl.L; }
+  const uu = u * end, trail = Math.min(0.5, Math.max(0.06, 90 / pl.L));
+  const a = Math.max(0, uu - trail), N = 7, pnt = [];
+  for (let i = 0; i <= N; i++) pnt.push(pointAlong(pts, pl, a + (uu - a) * i / N));
+  ctx.strokeStyle = b.color; ctx.lineCap = "round";
+  for (let i = 0; i < N; i++) {
+    const prevA = ctx.globalAlpha;
+    ctx.globalAlpha = prevA * (0.1 + 0.6 * (i + 1) / N); ctx.lineWidth = (1.5 + 3.5 * (i + 1) / N) * b.w;
+    ctx.beginPath(); ctx.moveTo(pnt[i].x, pnt[i].y); ctx.lineTo(pnt[i + 1].x, pnt[i + 1].y); ctx.stroke();
+    ctx.globalAlpha = prevA;
+  }
+  const h = pnt[N], prevA = ctx.globalAlpha;
+  ctx.fillStyle = b.color; ctx.globalAlpha = prevA * 0.22; ctx.beginPath(); ctx.arc(h.x, h.y, 13 * b.w, 0, 7); ctx.fill();
+  ctx.globalAlpha = prevA; ctx.beginPath(); ctx.arc(h.x, h.y, 4.5 * b.w, 0, 7); ctx.fill();
+}
+
+function arrive(M, b, pts) {
+  if (b.style === "ret") return;   // read values coming back: no flash, they would drown the real arrivals
+  const last = b.stopAt && b.end === "block" ? pts[b.stopAt] : pts[pts.length - 1];
+  last.fl = Math.max(last.fl, 0.5); last.flc = b.color;
+  if (b.end === "block") M.bursts.push({ x: last.x, y: last.y, age: 0, color: COL.blocked, cross: true });
+  else if (b.end === "dummy") M.bursts.push({ x: last.x, y: last.y, age: 0, color: COL.dummy, cross: false });
+  else if (b.style !== "lookup") M.bursts.push({ x: last.x, y: last.y, age: 0.4, color: b.color, cross: false });
+}
+function spawnReturn(M, b) {
+  M.beams.push({ via: b.via.slice().reverse(), color: b.color, born: M.W, dur: b.dur, w: 0.55, end: "arrive", ret: false, style: "ret", stopAt: 0 });
+}
+
+function txt(ctx, s, x, y, size, color, align, weight) {
+  ctx.font = `${weight || 500} ${size}px system-ui, "Segoe UI", sans-serif`;
+  ctx.fillStyle = color; ctx.textAlign = align || "center"; ctx.textBaseline = "middle"; ctx.fillText(s, x, y);
+}
+function runs(ctx, parts, cx, y, size) {     // coloured segments on one line, centred
+  ctx.font = `500 ${size}px system-ui, "Segoe UI", sans-serif`;
+  const gap = size * 0.9, ws = parts.map(p => ctx.measureText(p[0]).width), tot = ws.reduce((a, b) => a + b, 0) + gap * (parts.length - 1);
+  let x = cx - tot / 2; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  parts.forEach((p, i) => { ctx.fillStyle = p[1]; ctx.fillText(p[0], x, y); x += ws[i] + gap; });
+}
+
+function drawPlugin(ctx, M, n) {
+  const f = M.focus, isF = f === n.key, r = 34 * n.sc;
+  const active = n.state !== "idle";
+  let al = active ? 1 : 0.28;
+  if (f && !isF) al *= 0.55;
+  ctx.globalAlpha = al;
+  n.fl = Math.max(0, n.fl - 0.035);
+  if (n.fl > 0) { ctx.globalAlpha = al * n.fl * 0.5; ctx.fillStyle = n.flc; ctx.beginPath(); ctx.arc(n.x, n.y, r + 22 * n.fl, 0, 7); ctx.fill(); ctx.globalAlpha = al; }
+  ctx.fillStyle = n.state === "done" ? n.color + "55" : "#0d1117"; ctx.strokeStyle = n.color; ctx.lineWidth = isF ? 5 : 3.5;
+  ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7); ctx.fill(); ctx.stroke();
+  if (n.state === "loading") {
+    const a0 = (M.W / 250) % (Math.PI * 2); ctx.strokeStyle = "#fff"; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(n.x, n.y, r + 9, a0, a0 + 1.6); ctx.stroke();
+  }
+  if (n.fault) { ctx.strokeStyle = COL.fault; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(n.x, n.y, r + 9, 0, 7); ctx.stroke(); txt(ctx, "!", n.x, n.y + 1, 30 * n.sc, COL.fault, "center", 800); }
+  const small = n.sc < 0.7;
+  const lab = small && n.label.length > 16 ? n.label.slice(0, 15) + "…" : n.label.length > 30 ? n.label.slice(0, 29) + "…" : n.label;
+  if (n.x < LW * 0.4 && !isF && !small) {   // overview: label to the left of the node, so lines to the right stay clear
+    txt(ctx, lab, n.x - r - 30, n.y - 10, 22, n.color, "right", 600);
+    drawPluginStats(ctx, n, n.x - r - 30, n.y + 14, "right", 15);
+  } else {
+    txt(ctx, lab, n.x, n.y + r + (small ? 14 : 24), small ? 14 : 22 * (isF ? 1.2 : 1), n.color, "center", 600);
+    if (!small) drawPluginStats(ctx, n, n.x, n.y + r + (isF ? 58 : 50), "center", isF ? 19 : 15);
+  }
+  ctx.globalAlpha = 1;
+}
+function drawPluginStats(ctx, n, x, y, align, size) {
+  const s = n.st, parts = [];
+  if (s.lk) parts.push(`ID ${fmt(s.lk)}${s.ms ? " (" + fmt(s.ms) + " missing)" : ""}`);
+  if (s.vmr + s.vmw) parts.push(`VM ${fmt(s.vmr + s.vmw)}`);
+  if (s.msg) parts.push(`msg ${fmt(s.msg)}`);
+  if (s.pat) parts.push(`patch ${s.pat}`);
+  if (s.cs) parts.push(`save ${s.cs}`);
+  const rows = []; let cur = "";
+  for (const p of parts) { if (cur && (cur + p).length > 30) { rows.push(cur); cur = ""; } cur += (cur ? "  ·  " : "") + p; }
+  if (cur) rows.push(cur);
+  rows.forEach((r, i) => txt(ctx, r, x, y + i * (size + 5), size, "#9aa7b8", align, 500));
+}
+
+function rrect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+
+function drawHub(ctx, M, n) {
+  const hb = n.hub, h = M.hub[n.key] || {}, f = M.focus;
+  if (n.key === "life") { if (f) drawLife(ctx, M, n, M.nodes.get(f)); return; }
+  if (n.x < -300) return;
+  ctx.globalAlpha = f && n.key !== "bridge" ? 0.95 : 1;
+  n.fl = Math.max(0, n.fl - 0.035);
+  const glow = n.fl > 0 ? n.fl : 0;
+  if (n.key === "bridge") {
+    const r = hb.r;
+    if (glow) { ctx.globalAlpha = glow * 0.4; ctx.fillStyle = n.flc; ctx.beginPath(); ctx.arc(n.x, n.y, r + 20, 0, 7); ctx.fill(); ctx.globalAlpha = 1; }
+    ctx.fillStyle = "#0f1722"; ctx.strokeStyle = "#e6edf3"; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7); ctx.fill(); ctx.stroke();
+    txt(ctx, "SKSE-Bridge", n.x, n.y - 8, 21, "#e6edf3", "center", 700);
+    txt(ctx, M.meta.version ? "host " + M.meta.version : "", n.x, n.y + 20, 15, "#9aa7b8");
+    ctx.globalAlpha = 1; return;
+  }
+  const x = n.x - hb.w / 2, y = n.y - hb.h / 2;
+  if (glow) { ctx.globalAlpha = glow * 0.3; ctx.fillStyle = n.flc; rrect(ctx, x - 8, y - 8, hb.w + 16, hb.h + 16, 18); ctx.fill(); ctx.globalAlpha = 1; }
+  ctx.fillStyle = "#0f1722"; ctx.strokeStyle = "#3b4757"; ctx.lineWidth = 2.5; rrect(ctx, x, y, hb.w, hb.h, 14); ctx.fill(); ctx.stroke();
+  txt(ctx, n.label, n.x, y + 24, 21, "#e6edf3", "center", 650);
+  if (n.key === "idtable") {
+    runs(ctx, [[`ok ${fmt(h.tr + h.un)}`, COL.translated], [`remap ${fmt(h.rm)}`, COL.remapped], [`missing ${fmt(h.ms)}`, COL.missing]], n.x, y + 54, 17);
+    txt(ctx, "one private table per plugin", n.x, y + 78, 13, "#6e7a8a");
+  } else if (n.key === "shadowvm") {
+    runs(ctx, [[`reads ${fmt(h.r)}`, COL.read], [`writes ${fmt(h.w)}`, COL.write], [`dummy ${fmt(h.dummy)}`, COL.dummy]], n.x, y + 54, 17);
+    const rd = h.ready, st = Object.keys(rd).map(c => `${c}: ${rd[c] ? "ready" : "off"}`).join("  ");
+    txt(ctx, st || "no shadow active", n.x, y + 78, 13, "#6e7a8a");
+  } else if (n.key === "gamevm") {
+    txt(ctx, `redirected accesses ${fmt(h.n)}`, n.x, y + 54, 17, COL.read); txt(ctx, "SkyrimVM / PlayerCharacter", n.x, y + 78, 13, "#6e7a8a");
+  } else if (n.key === "gameexe") {
+    runs(ctx, [[`ok ${h.ok}`, COL.ok], [`warned ${h.wa + h.un}`, COL.warned], [`blocked ${h.bl}`, COL.blocked]], n.x, y + 54, 17);
+    txt(ctx, "patches & hooks (audited)", n.x, y + 78, 13, "#6e7a8a");
+  } else if (n.key === "cosave") {
+    txt(ctx, `saved ${h.sv}  ·  loaded ${h.ld} records`, n.x, y + 54, 16, COL.cosave);
+  } else if (n.key === "skse") {
+    txt(ctx, `to plugins ${fmt(h.in)}  ·  from plugins ${fmt(h.out)}`, n.x, y + 54, 15, COL.msg);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawLife(ctx, M, hubNode, p) {
+  if (!p) return;
+  const hb = hubNode.hub, x = hubNode.x - hb.w / 2, y = hubNode.y - hb.h / 2, L = p.life;
+  ctx.fillStyle = "#0f1722"; ctx.strokeStyle = p.color; ctx.lineWidth = 2.5; rrect(ctx, x, y, hb.w, hb.h, 14); ctx.fill(); ctx.stroke();
+  txt(ctx, "Load sequence", hubNode.x, y + 24, 19, "#e6edf3", "center", 650);
+  const rows = [
+    ["begin", L.begin != null ? "t " + (L.begin / 1000).toFixed(2) + " s" : null],
+    ["plan", L.plan || null],
+    ["table", L.table ? `${fmt(L.table.rows)} rows, ${fmt(L.table.ms)} missing` : null],
+    ["table handed over", L.open ? "yes" : null],
+    ["lookups traced", L.view || null],
+    ["DLL loaded", L.dll || null],
+    ["SKSE load", L.load || null],
+    ["shadow", L.shadow || null],
+  ];
+  rows.forEach((r, i) => {
+    const yy = y + 54 + i * 24, okv = r[1] && !/fail|not armed/.test(r[1]);
+    txt(ctx, r[1] ? (okv ? "✓" : "✗") : "·", x + 22, yy, 16, r[1] ? (okv ? COL.translated : COL.fault) : "#4a5565", "center", 700);
+    txt(ctx, r[0], x + 40, yy, 15, r[1] ? "#c9d4e2" : "#5d6978", "left");
+    if (r[1]) txt(ctx, String(r[1]).slice(0, 26), x + hb.w - 14, yy, 14, "#8d9bb0", "right");
+  });
+}
+
+function drawHud(ctx, M) {
+  txt(ctx, "SKSE-Bridge trace", 40, 38, 26, "#e6edf3", "left", 700);
+  const tms = M.idx ? M.items[M.idx - 1].t : 0;
+  txt(ctx, `trace time ${(tms / 1000).toFixed(2)} s${M.meta.game ? "   ·   game " + M.meta.game : ""}${M.focus ? "   ·   focus: " + M.nodes.get(M.focus).label : ""}`, 40, 68, 17, "#8d9bb0", "left");
+  // legend
+  const lg = [["ID translated", COL.translated], ["remapped", COL.remapped], ["missing / blocked", COL.missing], ["VM read", COL.read], ["VM write", COL.write], ["dummy", COL.dummy], ["message", COL.msg], ["co-save", COL.cosave], ["patch", COL.ok]];
+  ctx.textAlign = "left";
+  lg.forEach((l, i) => { const x = LW - 330 + (i % 2) * 170, y = 30 + Math.floor(i / 2) * 24; ctx.fillStyle = l[1]; ctx.beginPath(); ctx.arc(x, y, 6, 0, 7); ctx.fill(); txt(ctx, l[0], x + 12, y, 14, "#9aa7b8", "left"); });
+  // feed
+  const lines = M.feed.filter(e => !M.focus || (e.keys && e.keys.includes(M.focus))).slice(-8);
+  lines.forEach((e, i) => {
+    const y = LH - 40 - (lines.length - 1 - i) * 22;
+    ctx.globalAlpha = 0.45 + 0.55 * (i + 1) / lines.length;
+    txt(ctx, (e.t / 1000).toFixed(2).padStart(7) + " s   " + e.text, 40, y, 15, e.color || "#b4c0d0", "left");
+  });
+  ctx.globalAlpha = 1;
+  txt(ctx, "Each beam is a logged event (batched events: at most 5 beams, counters exact). Work inside a plugin's own code is not visible to the bridge.", LW - 40, LH - 14, 12, "#556070", "right");
+  // progress
+  ctx.fillStyle = "#1c2430"; ctx.fillRect(0, LH - 5, LW, 5); ctx.fillStyle = "#4cc9f0"; ctx.fillRect(0, LH - 5, LW * Math.min(1, M.P / M.total), 5);
+}
+
+// ======================================================================= playback + UI
+const gcv = $("g"), gctx = gcv.getContext("2d");
+function redraw() {
+  if (view === "graph" && GM) { gDraw(gctx, gcv.width / LW); $("seek").value = Math.round(1000 * Math.min(1, GM.P / GM.total)); $("clock").textContent = ""; }
+  else if (view === "map" && S) mapDraw();
+}
+function setPlaying(p) { playing = p; $("play").textContent = p ? "Pause" : "Play"; if (p) { last = performance.now(); requestAnimationFrame(tick); } }
+$("play").onclick = () => { if (rec) return; if (!playing && view === "graph" && GM && GM.endedAt !== null) { gRestart(); } setPlaying(!playing); };
+$("restart").onclick = () => { if (rec) return; restartAll(); if (!playing) redraw(); };
+$("speed").oninput = e => $("speedv").textContent = e.target.value + "x";
+$("full").onclick = () => { const el = view === "graph" ? $("gwrap") : document.documentElement; if (el.requestFullscreen) el.requestFullscreen(); };
+$("seek").oninput = e => {
+  if (rec) return;
+  const frac = +e.target.value / 1000;
+  if (view === "graph" && GM) { gSeek(frac); redraw(); }
+  else if (S) { mapRestart(); now = frac * S.total; mapAdvance(); mapDraw(); }
+};
+$("focus").onchange = e => { if (GM) { GM.focus = e.target.value; if (!playing) redraw(); } };
+gcv.addEventListener("click", e => {
+  if (!GM || rec) return;
+  const r = gcv.getBoundingClientRect(), x = (e.clientX - r.left) * LW / r.width, y = (e.clientY - r.top) * LH / r.height;
+  let best = null, bd = 70;
+  for (const k of GM.plugins) { const n = GM.nodes.get(k), d = Math.hypot(n.x - x, n.y - y); if (d < bd * Math.max(0.8, n.sc)) { bd = d; best = k; } }
+  GM.focus = best && best !== GM.focus ? best : "";
+  $("focus").value = GM.focus; if (!playing) redraw();
+});
+
+function tick(ts) {
+  if (!playing) return;
+  const dt = Math.min(ts - last, 100); last = ts;
+  if (view === "graph" && GM) {
+    gAdvance(dt); redraw();
+    const M = GM;
+    if (M.idx >= M.items.length && M.beams.length === 0 && M.bursts.length === 0) {
+      if (M.endedAt === null) M.endedAt = M.W;
+      if (M.W - M.endedAt > 1500) { setPlaying(false); if (rec) stopRecording(); return; }
+    }
+  } else if (S) {
+    now += dt * (S.total / (BASE_SECONDS * 1000)) * +$("speed").value;
+    mapAdvance(); mapDraw();
+    if (S.idx >= S.lookups.length && S.glow.every(g => g < 0.01)) { setPlaying(false); return; }
+  }
+  requestAnimationFrame(tick);
+}
+
+// ---- video export: the graph canvas is recorded directly (real time), so no screen recorder is needed ----
+function setCanvasSize() { const [w, h] = $("recsize").value.split("x").map(Number); gcv.width = w; gcv.height = h; redraw(); }
+$("recsize").onchange = () => { if (!rec) setCanvasSize(); };
+$("rec").onclick = () => { if (rec) stopRecording(); else startRecording(); };
+
+function startRecording() {
+  if (!GM || !gcv.captureStream || typeof MediaRecorder === "undefined") { alert("This browser cannot record a canvas (needs MediaRecorder + canvas.captureStream). Use Chrome, Edge or Firefox."); return; }
+  const mime = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm", "video/mp4"].find(m => MediaRecorder.isTypeSupported(m));
+  if (!mime) { alert("No supported video format in this browser."); return; }
+  setCanvasSize();
+  gRestart(); GM.focus = $("focus").value;
+  const stream = gcv.captureStream(60), chunks = [];
+  const mr = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: gcv.width >= 1920 ? 14e6 : 8e6 });
+  mr.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  mr.onstop = () => {
+    const blob = new Blob(chunks, { type: mime.split(";")[0] }), a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = "skse-bridge-trace-" + (GM.focus || "graph") + (mime.startsWith("video/mp4") ? ".mp4" : ".webm");
+    document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+    $("recstat").textContent = `saved ${(blob.size / 1048576).toFixed(1)} MB (${a.download})`; $("recstat").className = "";
+    window.__lastRecording = { size: blob.size, type: blob.type, name: a.download };
+  };
+  rec = { mr, mime };
+  mr.start(250);
+  $("rec").textContent = "Stop recording"; $("recstat").textContent = `recording ${gcv.width}x${gcv.height} in real time (~${Math.round(BASE_SECONDS / +$("speed").value + 2)} s at ${$("speed").value}x) - keep this tab visible`; $("recstat").className = "rec";
+  for (const id of ["restart", "seek", "play", "focus", "recsize", "vgraph", "vmap"]) $(id).disabled = true;
+  setPlaying(true);
+}
+
+function stopRecording() {
+  if (!rec) return;
+  const r = rec; rec = null;
+  setTimeout(() => { try { r.mr.stop(); } catch (_) { /* already stopped */ } }, 200);
+  $("rec").textContent = "Record video";
+  for (const id of ["restart", "seek", "play", "focus", "recsize", "vgraph"]) $(id).disabled = false;
+  $("vmap").disabled = !S;
+  setPlaying(false);
+}
+</script>
+</body>
+</html>

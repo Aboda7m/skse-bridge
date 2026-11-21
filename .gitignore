@@ -23,3 +23,8 @@ _to_delete/
 
 
 example-sources/
+
+# trace output (test only)
+SKSE-Bridge-trace*.jsonl
+SKSE-Bridge-trace-table-*.csv
+trace-out/

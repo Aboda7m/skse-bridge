@@ -27,6 +27,7 @@
 // is compiled out in release builds), so the feature behind that patch is missing instead of corrupting game
 // code. Other libraries may react differently; every refusal is logged with the plugin name.
 #include "common.h"
+#include "trace.h"
 
 #include <algorithm>
 #include <deque>
@@ -369,6 +370,8 @@ namespace bridge
 					 "will not work. (patch_guard=0 allows it.)",
 					module.c_str(), size, pd.where.c_str(), pd.note.c_str());
 				allow = false;
+				SKB_TRACE_DO(if (trace::want_patches()) trace::emit("patch", module,
+					trace::Fields().s("verdict", "blocked").u("size", size).s("where", pd.where).s("note", pd.note)));
 			} else {
 				pd.note = (k == Kind::block ? "UNSAFE (patch_guard=0, allowed): " : (k == Kind::warn ? "WARNING: " : "")) + pd.note;
 				(k == Kind::ok ? c.ok : c.warned)++;
@@ -383,6 +386,9 @@ namespace bridge
 				std::memcpy(after, p, it->n);
 				line("[patch] %s: %zu bytes at %s: %s -> %s. %s", it->module.c_str(), it->size, it->where.c_str(), hex(it->before, it->n).c_str(),
 					hex(after, it->n).c_str(), it->note.c_str());
+				SKB_TRACE_DO(if (trace::want_patches()) trace::emit("patch", it->module,
+					trace::Fields().s("verdict", it->note.rfind("WARNING", 0) == 0 ? "warned" : (it->note.rfind("UNSAFE", 0) == 0 ? "unsafe" : "ok"))
+						.u("size", it->size).s("where", it->where).s("before", hex(it->before, it->n)).s("after", hex(after, it->n)).s("note", it->note)));
 				g_pending.erase(it);
 				break;
 			}

@@ -2,7 +2,7 @@
 set_xmakever('2.8.2')
 
 set_project('SKSE-Bridge')
-set_version('0.7.3')
+set_version('0.7.4')
 set_languages('c++20')
 set_warnings('allextra')
 set_encodings('utf-8')
@@ -20,12 +20,23 @@ for _, name in ipairs({ 'skyrim_se', 'skyrim_ae', 'skyrim_vr' }) do
     option_end()
 end
 
+-- TEST-ONLY tracing (src/trace.cpp, docs/TRACE.md). Off by default: a normal/release build contains none of it.
+--   xmake f -m releasedbg --trace=y   then   xmake
+option('trace')
+    set_default(false)
+    set_showmenu(true)
+    set_description('Build the test-only trace logger (SKSE-Bridge-trace.jsonl). Never ship a DLL built with this.')
+option_end()
+
 target('SKSE-Bridge')
     set_kind('shared')
     set_arch('x64')
     add_files('src/*.cpp')
     add_headerfiles('src/*.h')
     add_defines('UNICODE', '_UNICODE')
+    if has_config('trace') then
+        add_defines('SKB_TRACE=1')
+    end
     add_syslinks('kernel32', 'user32', 'version', 'bcrypt', 'shell32', 'ole32', 'uuid')
     add_cxxflags('cl::/EHsc', 'cl::/permissive-', 'cl::/Zc:preprocessor')
     -- static CRT: the host must load without a VC++ redistributable dependency of its own

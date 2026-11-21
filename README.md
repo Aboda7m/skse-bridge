@@ -228,6 +228,11 @@ Requires MSVC and C++20. No external packages. Source is in `src/`. For develope
 
 Do not commit Address Library files; they are not part of this project.
 
+## Trace logging for testing
+
+A separate, opt-in test build (`xmake f --trace=y`) can log every Address Library ID each hosted plugin uses, plus shadow VM redirects, plugin messaging and co-save traffic,
+for charts and a node-graph video (`tools/trace_replay.html`). It is compiled out of normal builds. See `docs/TRACE.md`.
+
 ## Development and contributions
 
 SKSE-Bridge is an experimental community project. Inspecting the code, testing plugins, reporting results
