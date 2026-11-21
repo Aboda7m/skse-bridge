@@ -804,6 +804,16 @@ function stopRecording() {
   $("vmap").disabled = !S;
   setPlaying(false);
 }
+
+// Embedded trace (written by tools/bridge_viz.py): load it without a file picker.
+if (typeof window.__EMBEDDED_TRACE === "string") {
+  const evs = [];
+  for (const line of window.__EMBEDDED_TRACE.split("\n")) {
+    if (!line.trim()) continue;
+    try { evs.push(JSON.parse(line)); } catch (_) { /* truncated last line */ }
+  }
+  load(evs, {});
+}
 </script>
 </body>
 </html>

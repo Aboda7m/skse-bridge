@@ -16,6 +16,62 @@ namespace bridge
 				WriteFile(g_log, s, static_cast<DWORD>(n), &written, nullptr);
 			}
 		}
+
+		// Keep the previous session's logs. SKSE-Bridge.log is recreated on every launch, so without this a tester's earlier
+		// runs are gone before anyone can look at them. Copies SKSE-Bridge.log (and SKSE-Bridge-trace.jsonl, if a trace build
+		// wrote one) to SKSE-Bridge-history\SKSE-Bridge-<yyyymmdd-hhmmss>[-trace].<ext>, named after the log's last write
+		// time, and deletes the oldest sets beyond kKeepSessions. tools/bridge_viz.py reads that folder.
+		constexpr std::size_t kKeepSessions = 20;
+
+		void archive_previous_logs(const std::wstring& dir)
+		{
+			WIN32_FILE_ATTRIBUTE_DATA fa{};
+			if (!GetFileAttributesExW((dir + L"SKSE-Bridge.log").c_str(), GetFileExInfoStandard, &fa) ||
+				(fa.nFileSizeHigh == 0 && fa.nFileSizeLow == 0)) {
+				return;
+			}
+			FILETIME   local{};
+			SYSTEMTIME st{};
+			if (!FileTimeToLocalFileTime(&fa.ftLastWriteTime, &local) || !FileTimeToSystemTime(&local, &st)) {
+				return;
+			}
+			const std::wstring hist = dir + L"SKSE-Bridge-history\\";
+			CreateDirectoryW(hist.c_str(), nullptr);
+			wchar_t stamp[32];
+			std::swprintf(stamp, sizeof(stamp) / sizeof(stamp[0]), L"%04u%02u%02u-%02u%02u%02u", st.wYear, st.wMonth, st.wDay,
+				st.wHour, st.wMinute, st.wSecond);
+			const std::wstring base = hist + L"SKSE-Bridge-" + stamp;
+			CopyFileW((dir + L"SKSE-Bridge.log").c_str(), (base + L".log").c_str(), FALSE);
+			// the trace only belongs to this session if it was written within 10 minutes of the log (a stale one is skipped)
+			WIN32_FILE_ATTRIBUTE_DATA ta{};
+			if (GetFileAttributesExW((dir + L"SKSE-Bridge-trace.jsonl").c_str(), GetFileExInfoStandard, &ta)) {
+				const auto to64 = [](const FILETIME& f) { return (static_cast<unsigned long long>(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+				const unsigned long long a = to64(fa.ftLastWriteTime), b = to64(ta.ftLastWriteTime);
+				if ((a > b ? a - b : b - a) < 6000000000ULL) {  // 100 ns units: 10 minutes
+					CopyFileW((dir + L"SKSE-Bridge-trace.jsonl").c_str(), (base + L"-trace.jsonl").c_str(), FALSE);
+				}
+			}
+
+			std::vector<std::wstring> sets;  // "SKSE-Bridge-<stamp>.log" names, sortable by stamp
+			WIN32_FIND_DATAW          fd{};
+			const HANDLE              h = FindFirstFileW((hist + L"SKSE-Bridge-*.log").c_str(), &fd);
+			if (h != INVALID_HANDLE_VALUE) {
+				do {
+					if (std::wcslen(fd.cFileName) == 31) {  // "SKSE-Bridge-yyyymmdd-hhmmss.log": ignore anything else
+						sets.emplace_back(fd.cFileName);
+					}
+				} while (FindNextFileW(h, &fd));
+				FindClose(h);
+			}
+			if (sets.size() > kKeepSessions) {
+				std::sort(sets.begin(), sets.end());
+				for (std::size_t i = 0; i + kKeepSessions < sets.size(); ++i) {
+					const std::wstring stem = hist + sets[i].substr(0, sets[i].size() - 4);  // drop ".log"
+					DeleteFileW((stem + L".log").c_str());
+					DeleteFileW((stem + L"-trace.jsonl").c_str());
+				}
+			}
+		}
 	}
 
 	std::string narrow(std::wstring_view w)
@@ -232,7 +288,9 @@ namespace bridge
 		if (g_log != INVALID_HANDLE_VALUE) {
 			return;
 		}
-		g_log = CreateFileW((log_dir() + L"SKSE-Bridge.log").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+		const std::wstring dir = log_dir();
+		archive_previous_logs(dir);
+		g_log = CreateFileW((dir + L"SKSE-Bridge.log").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
 			FILE_ATTRIBUTE_NORMAL, nullptr);
 	}
 
