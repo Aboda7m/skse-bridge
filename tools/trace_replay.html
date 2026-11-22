@@ -74,6 +74,7 @@ const BASE_SECONDS = 30;         // length of the replay at 1x
 const $ = id => document.getElementById(id);
 const hex2rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
 const norm = n => String(n || "").toLowerCase().replace(/\.dll$/, "");
+const clip = (s, n) => { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
 const fmt = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e4 ? (n / 1e3).toFixed(1) + "k" : String(n);
 
 let S = null;                    // ID-map session
@@ -240,12 +241,12 @@ const COL = { translated: "#3ddc84", remapped: "#ffd166", missing: "#ff3b3b", un
 const HUBS = {
   skse:      { label: "SKSE",                  sub: "messaging host",          w: 190, h: 74 },
   bridge:    { label: "SKSE-Bridge",           sub: "",                        w: 0,   h: 0, r: 74 },
-  idtable:   { label: "Address Library table", sub: "",                        w: 290, h: 96 },
+  idtable:   { label: "Address Library table", sub: "",                        w: 390, h: 96 },
   shadowvm:  { label: "Shadow VM",             sub: "bridge-owned shadow",     w: 250, h: 96 },
   gamevm:    { label: "Real game objects",     sub: "SkyrimVM / PlayerCharacter", w: 270, h: 96 },
   gameexe:   { label: "Game code (exe)",       sub: "patches & hooks",         w: 270, h: 96 },
   cosave:    { label: "Co-save",               sub: "multiplexed by the bridge", w: 250, h: 82 },
-  life:      { label: "Load sequence",         sub: "",                        w: 330, h: 250 },
+  life:      { label: "Load sequence",         sub: "",                        w: 330, h: 300 },
 };
 
 function layoutTargets(M) {
@@ -317,18 +318,23 @@ function buildGraph(events, lookups, tables) {
           feedLine(M, e, `${trunc(e.plugin, 26)} plan: ${e.target}${e.translate ? " translated" : " native"}`, null, [k]); });
         break;
       case "table":
-        add(e.t, (M) => { const n = pn(M, e.plugin); n.life.table = { rows: e.rows, tr: e.translated, rm: e.remapped, ms: e.missing };
+        add(e.t, (M) => { const n = pn(M, e.plugin); n.life.table = { rows: e.rows, tr: e.translated, rm: e.remapped, ms: e.missing, native: !!e.native };
           n.st.tbl = { tr: e.translated, rm: e.remapped, ms: e.missing };
-          feedLine(M, e, `${trunc(e.plugin, 26)} table: ${fmt(e.rows)} rows, ${fmt(e.missing)} missing, ${fmt(e.remapped)} remapped`, null, [k]); });
+          const hb = M.hub.idtable; hb.rows = Math.max(hb.rows, e.rows || 0);
+          if (e.native) { hb.nat++; hb.natMiss += e.missing || 0; }
+          feedLine(M, e, e.native
+            ? `${trunc(e.plugin, 22)} reads the game's own table: ${fmt(e.rows)} IDs (built for ${e.built_for || "?"}), ${fmt(e.missing)} not in this game`
+            : `${trunc(e.plugin, 26)} table: ${fmt(e.rows)} rows, ${fmt(e.missing)} missing, ${fmt(e.remapped)} remapped`,
+            e.native && e.missing ? COL.warned : null, [k]); });
         break;
       case "table_open":
-        add(e.t, (M, silent) => { const n = pn(M, e.plugin); n.life.open = true;
+        add(e.t, (M, silent) => { const n = pn(M, e.plugin); n.life.open = true; n.life.openInfo = { mapping: e.mapping, bytes: e.bytes, kind: e.table_kind }; M.hub.idtable.open++;
           if (!silent) spawn(M, ["idtable", k], COL.table, { dur: 700, w: 1.5 });
           feedLine(M, e, `${trunc(e.plugin, 26)} is handed its table`, null, [k]); });
         break;
       case "table_view":
-        add(e.t, (M) => { const n = pn(M, e.plugin); n.life.view = e.armed ? "armed" : "not armed";
-          feedLine(M, e, `${trunc(e.plugin, 26)} table view ${e.armed ? "armed (lookups traced)" : "NOT armed: " + trunc(e.why, 40)}`, e.armed ? null : COL.warned, [k]); });
+        add(e.t, (M) => { const n = pn(M, e.plugin); n.life.view = e.armed ? "armed" : (/plain log/.test(e.why || "") ? "needs trace build" : "not armed");
+          feedLine(M, e, `${trunc(e.plugin, 26)} table view ${e.armed ? "armed (lookups traced)" : (/plain log/.test(e.why || "") ? "not traced (plain log)" : "NOT armed: " + trunc(e.why, 40))}`, e.armed || /plain log/.test(e.why || "") ? null : COL.warned, [k]); });
         break;
       case "dll_loaded":
         add(e.t, (M) => { const n = pn(M, e.plugin); n.life.dll = e.ok ? "ok" : "failed"; flash(n, e.ok ? "#ffffff" : COL.fault);
@@ -366,7 +372,44 @@ function buildGraph(events, lookups, tables) {
         });
         break;
       case "shadow_ready":
-        add(e.t, (M) => { M.hub.shadowvm.ready[e.class] = e.ok; feedLine(M, e, `shadow ${e.class} ${e.ok ? "ready (game layout " + (e.game_layout || "?") + ")" : "unavailable: " + trunc(e.why, 40)}`, e.ok ? null : COL.warned, []); });
+        add(e.t, (M) => { const sh = M.hub.shadowvm; sh.ready[e.class] = e.ok; sh.classes[e.class] = e;
+          feedLine(M, e, `shadow ${e.class} ${e.ok ? "ready (game layout " + (e.game_layout || "?") + (e.real_global && e.real_global !== "0x0" ? ", real global exe+" + e.real_global : "") + ")" : "unavailable: " + trunc(e.why, 52)}`, e.ok ? null : COL.warned, []); });
+        break;
+      case "shadow_choice":
+        add(e.t, (M) => { const n = pn(M, e.plugin); if (n) { n.life.choice = n.life.choice || {}; n.life.choice[e.class] = e.on; }
+          feedLine(M, e, `${trunc(e.plugin, 24)}: ${e.class} shadow ${e.on ? "ON" : "off"}`, null, [k]); });
+        break;
+      case "shadow_table":
+        add(e.t, (M) => { const n = pn(M, e.plugin); if (n) { n.life.shadowIds = n.life.shadowIds || []; n.life.shadowIds.push(e.id); }
+          M.hub.idtable.shadowIds++;
+          feedLine(M, e, `${trunc(e.plugin, 22)} table: ID ${e.id} (${e.class}) -> shadow global`, null, [k]); });
+        break;
+      case "vm_summary":
+        add(e.t, (M) => { const sh = M.hub.shadowvm; sh.sum = e; sh.sums.push(e);
+          feedLine(M, e, `shadow summary (${trunc(e.when, 22)}): ${e.accesses} member accesses, ${e.global_reads} global reads, ${e.game_side} from game code, ${e.unresolved} unresolved`, e.unresolved ? COL.warned : null, []); });
+        break;
+      case "patch_summary":
+        if (e.blocked || e.left_writable) add(e.t, (M) => feedLine(M, e, `${trunc(e.plugin, 22)} patches (${trunc(e.when, 20)}): ${e.ok} ok, ${e.warned} warned, ${e.blocked} blocked, ${e.left_writable} left writable`, COL.warned, [k]));
+        break;
+      case "idlib":
+        add(e.t, (M) => { M.hub.idtable.lib = { format: e.format, rows: e.rows, file: e.file }; M.hub.idtable.rows = Math.max(M.hub.idtable.rows, e.rows || 0);
+          feedLine(M, e, `Address Library ${e.file || ""}: format ${e.format}, ${fmt(e.rows)} IDs`, null, []); });
+        break;
+      case "preflight":
+        add(e.t, (M) => { M.hub.idtable.pre = e; if (e.ok) M.hub.idtable.rows = Math.max(M.hub.idtable.rows, e.rows || 0);
+          feedLine(M, e, e.ok ? `preflight ok: game ${e.game}, format ${e.format}, ${fmt(e.rows)} IDs` : `preflight FAILED: ${trunc(e.why, 60)}`, e.ok ? null : COL.fault, []); });
+        break;
+      case "preflight_rules":
+        add(e.t, (M) => { M.hub.idtable.globalRules = e.rules; feedLine(M, e, `${e.rules} global remap rule(s) from ${e.file}`, null, []); });
+        break;
+      case "table_remaps":
+        add(e.t, (M) => { const n = pn(M, e.plugin); if (n) n.life.remaps = e;
+          feedLine(M, e, `${trunc(e.plugin, 22)} remaps: ${e.known} known, ${e.inferred} inferred, ${e.glob} global, ${e.overlay} overlay`, null, [k]); });
+        break;
+      case "table_refused":
+        add(e.t, (M, silent) => { const n = pn(M, e.plugin); if (n) { n.life.refused = e.why; flash(n, COL.missing); }
+          if (n && !silent) spawn(M, ["idtable", k], COL.missing, { dur: 800, w: 2, end: "block" });
+          feedLine(M, e, `${trunc(e.plugin, 22)} table request REFUSED (${trunc(e.why, 30)})`, COL.missing, [k]); });
         break;
       case "shadow_attach":
         add(e.t, (M) => { const n = pn(M, e.plugin); n.life.shadow = e.classes; declare(M, k, "shadowvm");
@@ -379,6 +422,9 @@ function buildGraph(events, lookups, tables) {
           const n = e.plugin ? pn(M, e.plugin) : null;
           if (n) n.st[e.write ? "vmw" : "vmr"] += d;
           h[e.write ? "w" : "r"] += d;
+          const mk = `${src}|${e.class}|${e.off}`; let mm = h.members.get(mk);
+          if (!mm) h.members.set(mk, mm = { who: e.plugin || (e.whole ? "game code (whole object)" : "game code"), game: src === "gameexe", cls: e.class, off: e.off, real: e.real, layout: e.layout, tg, write: false, n: 0 });
+          mm.n += d; mm.write = mm.write || !!e.write; mm.tg = tg; if (e.real) mm.real = e.real;
           if (tg === "real") M.hub.gamevm.n += d; else h.dummy += d;
           if (!silent) {
             const via = tg === "real" ? [src, "shadowvm", "gamevm"] : [src, "shadowvm"];
@@ -451,7 +497,7 @@ function newNodeState(n) {
 function resetRuntime(M) {
   for (const n of M.nodes.values()) if (n.kind === "plugin") newNodeState(n);
   M.P = 0; M.W = 0; M.idx = 0; M.beams = []; M.bursts = []; M.edges = new Map(); M.feed = []; M.seen = new Set();
-  M.hub = { idtable: { tr: 0, rm: 0, ms: 0, un: 0 }, shadowvm: { r: 0, w: 0, dummy: 0, ready: {} }, gamevm: { n: 0 }, gameexe: { ok: 0, wa: 0, un: 0, bl: 0 },
+  M.hub = { idtable: { tr: 0, rm: 0, ms: 0, un: 0, open: 0, rows: 0, nat: 0, natMiss: 0, lib: null, pre: null, globalRules: 0, shadowIds: 0 }, shadowvm: { r: 0, w: 0, dummy: 0, ready: {}, classes: {}, members: new Map(), sum: null, sums: [] }, gamevm: { n: 0 }, gameexe: { ok: 0, wa: 0, un: 0, bl: 0 },
             cosave: { sv: 0, ld: 0 }, skse: { in: 0, out: 0 }, bridge: { msgs: 0 } };
   M.meta.version = M.meta.version || ""; M.endedAt = null;
 }
@@ -544,6 +590,7 @@ function gDraw(ctx, scale) {
   }
   ctx.globalAlpha = 1;
   for (const n of M.nodes.values()) { if (n.kind === "plugin") drawPlugin(ctx, M, n); else drawHub(ctx, M, n); }
+  drawPanels(ctx, M);
   drawHud(ctx, M);
 }
 
@@ -659,8 +706,13 @@ function drawHub(ctx, M, n) {
   ctx.fillStyle = "#0f1722"; ctx.strokeStyle = "#3b4757"; ctx.lineWidth = 2.5; rrect(ctx, x, y, hb.w, hb.h, 14); ctx.fill(); ctx.stroke();
   txt(ctx, n.label, n.x, y + 24, 21, "#e6edf3", "center", 650);
   if (n.key === "idtable") {
-    runs(ctx, [[`ok ${fmt(h.tr + h.un)}`, COL.translated], [`remap ${fmt(h.rm)}`, COL.remapped], [`missing ${fmt(h.ms)}`, COL.missing]], n.x, y + 54, 17);
-    txt(ctx, "one private table per plugin", n.x, y + 78, 13, "#6e7a8a");
+    if (h.tr + h.un + h.rm + h.ms === 0) {      // no per-ID lookups in the data (plain log): show what the log does know
+      runs(ctx, [[`${h.open} plugin${h.open === 1 ? "" : "s"} handed a table`, COL.translated], [`${fmt(h.rows)} IDs`, COL.table]], n.x, y + 54, 17);
+      txt(ctx, h.natMiss ? `${fmt(h.natMiss)} IDs absent in this game \u00b7 lookups need a trace build` : "per-ID lookups need a trace build", n.x, y + 78, 13, h.natMiss ? COL.warned : "#6e7a8a");
+    } else {
+      runs(ctx, [[`ok ${fmt(h.tr + h.un)}`, COL.translated], [`remap ${fmt(h.rm)}`, COL.remapped], [`missing ${fmt(h.ms)}`, COL.missing]], n.x, y + 54, 17);
+      txt(ctx, "one private table per plugin", n.x, y + 78, 13, "#6e7a8a");
+    }
   } else if (n.key === "shadowvm") {
     runs(ctx, [[`reads ${fmt(h.r)}`, COL.read], [`writes ${fmt(h.w)}`, COL.write], [`dummy ${fmt(h.dummy)}`, COL.dummy]], n.x, y + 54, 17);
     const rd = h.ready, st = Object.keys(rd).map(c => `${c}: ${rd[c] ? "ready" : "off"}`).join("  ");
@@ -678,6 +730,62 @@ function drawHub(ctx, M, n) {
   ctx.globalAlpha = 1;
 }
 
+function panelBox(ctx, x, y, w, h, title, sub) {
+  ctx.globalAlpha = 1; ctx.fillStyle = "rgba(15,23,34,0.94)"; ctx.strokeStyle = "#2a3544"; ctx.lineWidth = 1.5; rrect(ctx, x, y, w, h, 10); ctx.fill(); ctx.stroke();
+  txt(ctx, title, x + 12, y + 16, 14, "#c9d4e2", "left", 650);
+  if (sub) txt(ctx, clip(sub, Math.floor((w - 24 - title.length * 8.2) / 6.2)), x + w - 12, y + 16, 12, "#6e7a8a", "right");
+}
+
+// Detail panels: everything the log says about the Shadow VM and the Address Library table, drawn under their hub nodes.
+function drawPanels(ctx, M) {
+  const at = M.nodes.get("idtable"), sv = M.nodes.get("shadowvm"), gv = M.nodes.get("gamevm");
+  if (at && at.x > -300 && sv) {
+    const hb = at.hub, x = at.x - hb.w / 2, y = at.y + hb.h / 2 + 12, w = hb.w, h = Math.max(90, sv.y - sv.hub.h / 2 - 12 - y);
+    const I = M.hub.idtable, rows = M.plugins.map(k => M.nodes.get(k)).filter(n => n && n.life && (n.life.table || n.life.open));
+    if (I.lib || I.pre || rows.length) {
+      const lib = I.lib, pre = I.pre;
+      panelBox(ctx, x, y, w, h, "Address Library tables", pre && !pre.ok ? "preflight FAILED" : lib ? `fmt ${lib.format} \u00b7 ${fmt(lib.rows)} IDs` : pre ? `fmt ${pre.format} \u00b7 ${fmt(pre.rows)} IDs` : "");
+      const room = Math.floor((h - 34) / 19);
+      rows.slice(0, room).forEach((n, i) => {
+        const L = n.life, T = L.table, yy = y + 36 + i * 19;
+        txt(ctx, clip(n.label, 14), x + 12, yy, 13, "#c9d4e2", "left");
+        if (L.shadowIds) txt(ctx, "\u21e2 shadow", x + 112, yy, 12, COL.read, "left");
+        if (L.refused) txt(ctx, "REFUSED " + clip(L.refused, 18), x + w - 12, yy, 13, COL.missing, "right");
+        else if (T && T.native) txt(ctx, `native \u00b7 ${fmt(T.rows)} IDs`, x + w - 12, yy, 13, T.ms ? COL.warned : COL.translated, "right");
+        else if (T) txt(ctx, `ok ${fmt(T.tr)} \u00b7 remap ${fmt(T.rm)} \u00b7 miss ${fmt(T.ms)}`, x + w - 12, yy, 13, T.ms ? COL.warned : COL.translated, "right");
+        else txt(ctx, "table handed over", x + w - 12, yy, 13, "#8d9bb0", "right");
+      });
+      if (rows.length > room) txt(ctx, `+${rows.length - room} more plugin(s)`, x + 12, y + h - 12, 12, "#6e7a8a", "left");
+    }
+  }
+  if (sv && sv.x > -300 && gv) {
+    const S = M.hub.shadowvm, mem = [...S.members.values()].sort((a, b) => b.n - a.n), cls = Object.keys(S.classes);
+    if (!mem.length && !cls.length) return;
+    const x = sv.x - sv.hub.w / 2, right = gv.x + gv.hub.w / 2, y = sv.y + sv.hub.h / 2 + 14, w = right - x, h = 192;
+    const sum = S.sum;
+    panelBox(ctx, x, y, w, h, "Shadow VM \u00b7 member map", sum ? `${sum.when}: ${sum.accesses} accesses \u00b7 ${sum.global_reads} global reads \u00b7 ${sum.game_side} game-side \u00b7 ${sum.unresolved} unresolved` : "");
+    let yy = y + 36;
+    cls.forEach(c => {
+      const e = S.classes[c];
+      const t = e.ok ? `${c} \u00b7 game ${e.game_layout || "?"} \u00b7 shadow ${e.bytes ? "0x" + Number(e.bytes).toString(16).toUpperCase() + " B" : "?"} \u00b7 exe+${String(e.real_global || "?").replace(/^0x/, "")}${e.insert_at ? ` \u00b7 \u2265${e.insert_at} shifts +0x${Number(e.inserted).toString(16).toUpperCase()} in 1.7` : ""}` : `${c}: unavailable (${e.why || "?"})`;
+      txt(ctx, clip(t, Math.floor((w - 24) / 6.6)), x + 12, yy, 12.5, e.ok ? "#8d9bb0" : COL.warned, "left"); yy += 17;
+    });
+    yy += 4;
+    const cx = [12, 175, 395];
+    ["accessed by", "member: shadow \u2192 real offset", "mode", "count"].forEach((t, i) => txt(ctx, t, i === 3 ? x + w - 12 : x + cx[i], yy, 11.5, "#5d6978", i === 3 ? "right" : "left", 650));
+    yy += 17;
+    const room = Math.max(0, Math.floor((y + h - 26 - yy) / 17));
+    mem.slice(0, room).forEach((m, i) => {
+      const dummy = m.tg !== "real", col = dummy ? COL.dummy : m.write ? COL.write : COL.read, yy2 = yy + i * 17;
+      txt(ctx, clip(m.who, 26), x + cx[0], yy2, 12.5, m.game ? "#9aa7b8" : "#c9d4e2", "left");
+      txt(ctx, `${m.cls}+${m.off} \u2192 ${dummy ? "dummy" : "+" + m.real}`, x + cx[1], yy2, 12.5, col, "left");
+      txt(ctx, `${m.write ? "write" : "read"}${m.tg === "pending" ? " \u00b7 pending" : m.tg === "absent" ? " \u00b7 absent" : ""}`, x + cx[2], yy2, 12.5, col, "left");
+      txt(ctx, "\u00d7" + fmt(m.n), x + w - 12, yy2, 12.5, col, "right");
+    });
+    txt(ctx, "pending = game object not created yet \u00b7 absent = member does not exist in this runtime (both read a dummy)" + (mem.length > room ? `  \u00b7  +${mem.length - room} more member(s)` : ""), x + 12, y + h - 11, 11, "#6e7a8a", "left");
+  }
+}
+
 function drawLife(ctx, M, hubNode, p) {
   if (!p) return;
   const hb = hubNode.hub, x = hubNode.x - hb.w / 2, y = hubNode.y - hb.h / 2, L = p.life;
@@ -692,10 +800,14 @@ function drawLife(ctx, M, hubNode, p) {
     ["DLL loaded", L.dll || null],
     ["SKSE load", L.load || null],
     ["shadow", L.shadow || null],
+    ["table remaps", L.remaps ? `${L.remaps.known} known \u00b7 ${L.remaps.inferred} inferred` : null],
+    ["shadow IDs in table", L.shadowIds ? L.shadowIds.join(", ") : null],
+    ["table mapping", L.openInfo ? `${L.openInfo.kind || ""} ${fmt(L.openInfo.bytes)} B`.trim() : null],
   ];
   rows.forEach((r, i) => {
-    const yy = y + 54 + i * 24, okv = r[1] && !/fail|not armed/.test(r[1]);
-    txt(ctx, r[1] ? (okv ? "✓" : "✗") : "·", x + 22, yy, 16, r[1] ? (okv ? COL.translated : COL.fault) : "#4a5565", "center", 700);
+    const yy = y + 54 + i * 24, okv = r[1] && !/fail|not armed|needs trace/.test(r[1]);
+    const neutral = r[1] && /needs trace/.test(r[1]);
+    txt(ctx, r[1] ? (neutral ? "–" : okv ? "✓" : "✗") : "·", x + 22, yy, 16, r[1] ? (neutral ? "#6e7a8a" : okv ? COL.translated : COL.fault) : "#4a5565", "center", 700);
     txt(ctx, r[0], x + 40, yy, 15, r[1] ? "#c9d4e2" : "#5d6978", "left");
     if (r[1]) txt(ctx, String(r[1]).slice(0, 26), x + hb.w - 14, yy, 14, "#8d9bb0", "right");
   });

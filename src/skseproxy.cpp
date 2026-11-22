@@ -233,6 +233,9 @@ namespace bridge
 				vm_shadow_report("after kDataLoaded");
 				vm_session_reached_game();  // got through startup with the shadow: no reason to re-ask next launch
 			}
+			if (from == "skse" && (msg->type == 2 || msg->type == 4)) {  // kPreLoadGame / kSaveGame: catch activity during play
+				vm_shadow_report(msg->type == 2 ? "before kPreLoadGame" : "at kSaveGame", true);
+			}
 			if (from == "skse" && (msg->type == 3 || msg->type == 7)) {  // kPostLoadGame / kNewGame
 				vm_shadow_report(msg->type == 3 ? "after kPostLoadGame" : "after kNewGame");
 				vm_session_reached_game();

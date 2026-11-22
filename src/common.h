@@ -323,7 +323,7 @@ namespace bridge
 	std::uint64_t shadow_id(ShadowClass cls);
 	const char*   shadow_name(ShadowClass cls);
 	void          shadow_add_module(HMODULE mod, const std::string& name, bool layout17, unsigned classes);
-	void          vm_shadow_report(const char* when);
+	void          vm_shadow_report(const char* when, bool onlyIfChanged = false);
 	void          vm_session_reached_game();  // main.cpp: clears the crash marker
 
 	// ---- earlyload.cpp : patch a legacy module before its DllMain / static initializers run ----

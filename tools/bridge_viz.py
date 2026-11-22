@@ -21,7 +21,7 @@ A plain log has no per-ID lookups, so the Address Library node stays empty; trac
 """
 import argparse, glob, json, os, re, shutil, sys, tempfile, zipfile
 
-HERE = os.path.dirname(os.path.abspath(getattr(sys, "_MEIPASS", __file__)))
+HERE = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))  # _MEIPASS = unpacked exe bundle
 sys.path.insert(0, HERE)
 import log_to_trace  # noqa: E402
 
@@ -102,7 +102,8 @@ def load_events(s):
         if ev:
             return ev, "trace (exact lookups)"
     if s["log"]:
-        return log_to_trace.convert([s["log"]]), "plain log (no per-ID lookups)"
+        s["stats"] = {}                      # filled by the converter: lines it could not parse (see report())
+        return log_to_trace.convert([s["log"]], s["stats"]), "plain log (no per-ID lookups)"
     return [], "nothing"
 
 
@@ -143,6 +144,25 @@ def report(s, events, source):
                 n += 1
         if not n:
             add("  none found in the log")
+    if s["log"]:
+        sh = [m[1].strip() for m in (re.match(r"^\[[^\]]+\] \[t\d+\] (\[(?:vm-)?shadow\].*|\s*(?:vm|player)-shadow:.*|\s*shadow: ID .*)$", ln) for ln in txt) if m]
+        add("")
+        add("== shadow VM (every shadow line in the log; the replay's member map is built from these) ==")
+        for ln in sh[:80]:
+            add("  " + ln[:200])
+        if len(sh) > 80:
+            add("  ... %d more shadow line(s) in the log" % (len(sh) - 80))
+        if not sh:
+            add("  no shadow lines: no plugin used the VM / PlayerCharacter shadow in this session")
+    st = s.get("stats")
+    if st is not None:
+        add("")
+        add("== log lines the visualiser did not understand ==")
+        un = st.get("unmatched", {})
+        if not un:
+            add("  none: every tagged log line was turned into replay events")
+        for tag, lines in sorted(un.items()):
+            add("  %s: %d line(s) not parsed (log format and tools/log_to_trace.py differ); first: %s" % (tag, len(lines), lines[0]))
     kinds = {}
     for e in events:
         kinds[e["ev"]] = kinds.get(e["ev"], 0) + 1

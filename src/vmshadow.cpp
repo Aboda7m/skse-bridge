@@ -516,11 +516,18 @@ namespace bridge
 	}
 #endif
 
-	void vm_shadow_report(const char* when)
+	void vm_shadow_report(const char* when, bool onlyIfChanged)
 	{
 		if (!g_ready) {
 			return;
 		}
+		// onlyIfChanged: called on frequent events (save, pre-load); stay silent while nothing new was redirected
+		static long long s_lastTotal = -1;
+		const long long  total = static_cast<long long>(g_faults) + g_gReads + g_gameSide + g_unresolved;
+		if (onlyIfChanged && total == s_lastTotal) {
+			return;
+		}
+		s_lastTotal = total;
 		logf("[shadow] summary (%s): %lld member access(es), %lld global read(s), %lld from game code, %lld unresolved", when,
 			static_cast<long long>(g_faults), static_cast<long long>(g_gReads), static_cast<long long>(g_gameSide), static_cast<long long>(g_unresolved));
 		AcquireSRWLockShared(&g_lock);
